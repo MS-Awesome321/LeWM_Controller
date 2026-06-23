@@ -16,11 +16,10 @@ All distances are in mm (the unit used during training).
 from __future__ import annotations
 
 import argparse
+import json
+import subprocess
 import sys
-import threading
 import time
-from multiprocessing import Process, Value, Event
-from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 
 import cv2
@@ -190,146 +189,39 @@ def cem_plan(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Camera process + shared-memory helpers
+# Camera helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-CAM_H, CAM_W = 480, 640   # native capture resolution (resized to IMG_SIZE for the model)
+def capture_frame(cam) -> np.ndarray:
+    """Returns (H, W, 3) uint8 RGB from a CameraController instance."""
+    bgr = cam.snap()
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
-def _camera_process(shm_name: str, frame_counter, stop_event,
-                    cam_index: int = 0, cam_fps: int = 15):
-    """
-    Runs in a separate process.  Continuously snaps frames and writes them into
-    the named SharedMemory block, then increments frame_counter.
-    """
-    from hardware.camera_controller import CameraController
-
-    buf = SharedMemory(name=shm_name)
-    arr = np.ndarray((CAM_H, CAM_W, 3), dtype=np.uint8, buffer=buf.buf)
-
-    cam = CameraController(index=cam_index, fps=cam_fps)
-    cam.start()
+def send_overlay(proc: subprocess.Popen, best_actions: torch.Tensor,
+                 elite_actions: torch.Tensor, dist: float, step: int) -> None:
+    """Serialise plan data as a single JSON line and write to liveview's stdin."""
+    if proc is None or proc.poll() is not None:
+        return
+    payload = json.dumps({
+        'step':  step,
+        'dist':  dist,
+        'best':  best_actions.cpu().tolist(),
+        'elite': elite_actions.cpu().tolist(),
+    }, separators=(',', ':'))
     try:
-        while not stop_event.is_set():
-            try:
-                bgr = cam.snap()
-                if bgr.shape[:2] != (CAM_H, CAM_W):
-                    bgr = cv2.resize(bgr, (CAM_W, CAM_H))
-                np.copyto(arr, bgr)
-                with frame_counter.get_lock():
-                    frame_counter.value += 1
-            except Exception:
-                pass
-    finally:
-        cam.stop()
-        buf.close()
-
-
-def read_shared_frame(shm_arr: np.ndarray) -> np.ndarray:
-    """Snapshot the shared frame and return it as (H, W, 3) uint8 RGB."""
-    return cv2.cvtColor(shm_arr.copy(), cv2.COLOR_BGR2RGB)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Visualisation
-# ─────────────────────────────────────────────────────────────────────────────
-
-def draw_overlay(
-    frame_rgb:     np.ndarray,       # (H, W, 3) uint8 RGB — current frame
-    elite_actions: torch.Tensor,     # (n_elite, horizon, 3) — all elite sequences
-    best_actions:  torch.Tensor,     # (horizon, 3) — mean/best sequence
-    dist:          float,            # current embedding distance to goal
-    step:          int,
-    px_per_mm:     float = 8.0,      # visual scale: mm → pixels
-    win_size:      tuple = (800, 600),
-) -> None:
-    """
-    Display current frame with elite action trajectories overlaid.
-
-    The (Δx, Δy) components of each action sequence are projected onto the
-    image plane as cumulative trajectories from the image centre.
-    Δz is shown as a colour tint (blue = down, red = up).
-    """
-    h, w = frame_rgb.shape[:2]
-    canvas = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR).copy()
-    canvas = cv2.resize(canvas, win_size)
-    cw, ch = win_size
-    cx, cy = cw // 2, ch // 2        # trajectory origin: image centre
-
-    # scale factor accounting for potential frame resize
-    sx = (cw / w) * px_per_mm
-    sy = (ch / h) * px_per_mm
-
-    # ── draw all elite trajectories (dim grey) ────────────────────────────────
-    for seq in elite_actions.numpy():                  # (horizon, 3)
-        pts = [(cx, cy)]
-        for dx, dy, _ in seq:
-            px = int(pts[-1][0] + dx * sx)
-            py = int(pts[-1][1] - dy * sy)             # y-axis flipped (image coords)
-            pts.append((px, py))
-        for a, b in zip(pts[:-1], pts[1:]):
-            cv2.line(canvas, a, b, (80, 80, 80), 1, cv2.LINE_AA)
-        cv2.circle(canvas, pts[-1], 2, (80, 80, 80), -1)
-
-    # ── draw best (mean) trajectory (bright green + step dots) ───────────────
-    best_np = best_actions.cpu().numpy()                     # (horizon, 3)
-    pts = [(cx, cy)]
-    for dx, dy, dz in best_np:
-        px = int(pts[-1][0] + dx * sx)
-        py = int(pts[-1][1] - dy * sy)
-        pts.append((px, py))
-
-    for i, (a, b) in enumerate(zip(pts[:-1], pts[1:])):
-        dz = float(best_np[i, 2])
-        # colour: green base, shift toward red (dz>0 = up) or blue (dz<0 = down)
-        r = max(0, min(255, int(128 + dz * 12)))
-        g = 220
-        b_ch = max(0, min(255, int(128 - dz * 12)))
-        cv2.line(canvas, a, b, (b_ch, g, r), 2, cv2.LINE_AA)
-        cv2.circle(canvas, b, 3, (b_ch, g, r), -1)
-
-    cv2.circle(canvas, pts[0], 5, (0, 255, 255), -1)  # origin dot (yellow)
-
-    # ── text overlay ──────────────────────────────────────────────────────────
-    first = best_np[0]
-    lines = [
-        f'Step {step}',
-        f'Dist to goal: {dist:.3f}',
-        f'Next action  x={first[0]:+.2f}  y={first[1]:+.2f}  z={first[2]:+.2f} mm',
-    ]
-    for i, text in enumerate(lines):
-        cv2.putText(canvas, text, (10, 24 + i * 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(canvas, text, (10, 24 + i * 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
-
-    cv2.imshow('CEM-MPC  |  elite plans', canvas)
-    cv2.waitKey(1)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MPC loop
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _pump_camera_during_move(shm_arr: np.ndarray, stop_event: threading.Event) -> None:
-    """Display live frames from shared memory until stop_event is set."""
-    while not stop_event.is_set():
-        frame = read_shared_frame(shm_arr)
-        bgr   = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        bgr   = cv2.resize(bgr, (800, 600))
-        cv2.putText(bgr, 'Moving...', (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(bgr, 'Moving...', (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
-        cv2.imshow('CEM-MPC  |  elite plans', bgr)
-        cv2.waitKey(1)
+        proc.stdin.write((payload + '\n').encode())
+        proc.stdin.flush()
+    except BrokenPipeError:
+        pass
 
 
 def run_mpc(
-    goal_image:      np.ndarray,    # (H, W, 3) uint8 RGB
+    goal_image:      np.ndarray,         # (H, W, 3) uint8 RGB
     vae, encoder, projector, delta_embedder, ldp,
-    robot,                          # TransferControl instance (or None)
-    shm_arr:         np.ndarray | None,  # numpy view into shared camera memory (or None for dry-run)
+    robot,                               # TransferControl instance (or None)
+    cam,                                 # CameraController instance (or None for dry-run)
+    liveview_proc:   subprocess.Popen | None,
     *,
     device:          str   = 'cpu',
     max_steps:       int   = 50,
@@ -346,10 +238,10 @@ def run_mpc(
     settle_s:        float = 0.5,
 ) -> dict:
     """
-    MPC loop: read shared-memory frame → plan → execute first action → repeat.
+    MPC loop: capture frame → plan → send overlay to liveview → execute → repeat.
 
     Returns cumulative displacement per axis so the caller can home on interrupt.
-    shm_arr=None triggers dry-run (black frame, no robot moves).
+    cam=None triggers dry-run (black frame, no robot moves).
     """
     goal_emb = frame_to_embedding(goal_image, vae, encoder, projector, device)
     print(f'Goal embedding norm: {goal_emb.norm().item():.3f}')
@@ -358,10 +250,8 @@ def run_mpc(
 
     for step in range(max_steps):
         # ── observe ───────────────────────────────────────────────────────────
-        if shm_arr is not None:
-            frame = read_shared_frame(shm_arr)
-        else:
-            frame = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
+        frame = capture_frame(cam) if cam is not None else \
+                np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
 
         current_emb = frame_to_embedding(frame, vae, encoder, projector, device)
         dist = (current_emb - goal_emb).norm().item()
@@ -382,25 +272,19 @@ def run_mpc(
         plan_ms = (time.perf_counter() - t0) * 1000
         print(f'  CEM done in {plan_ms:.0f} ms  |  predicted final cost: {best_cost:.4f}')
 
-        draw_overlay(frame, elite_actions, best_actions, dist, step + 1)
+        # send plan to liveview subprocess — it draws while we move
+        send_overlay(liveview_proc, best_actions, elite_actions, dist, step + 1)
 
         # ── execute first action ───────────────────────────────────────────────
         raw_action = best_actions[0].cpu().numpy()   # (3,) [Δx, Δy, Δz] mm
         action     = raw_action * action_scale
 
         if robot is not None:
-            stop_evt    = threading.Event()
-            pump_thread = threading.Thread(
-                target=_pump_camera_during_move, args=(shm_arr, stop_evt), daemon=True
-            )
-            pump_thread.start()
             for ax, delta in zip(axes, action):
                 print(f'  move {ax} by {delta:+.3f} mm  (raw {raw_action[list(axes).index(ax)]:+.3f} × {action_scale})')
                 robot.move_axis_by(ax, float(delta))
                 cumulative[ax] += float(delta)
             time.sleep(settle_s)
-            stop_evt.set()
-            pump_thread.join()
         else:
             for ax, delta in zip(axes, action):
                 print(f'  move {ax} by {delta:+.3f} mm  (no-op)')
@@ -468,23 +352,19 @@ def main():
 
     goal_image = read_rgb(args.goal)
 
-    # ── camera process + shared memory ────────────────────────────────────────
-    shm       = None
-    shm_arr   = None
-    cam_proc  = None
-    stop_event = Event()
+    # ── liveview subprocess ────────────────────────────────────────────────────
+    liveview_proc = None
+    cam           = None
 
     if not args.dry_run:
-        frame_bytes   = CAM_H * CAM_W * 3
-        shm           = SharedMemory(create=True, size=frame_bytes)
-        shm_arr       = np.ndarray((CAM_H, CAM_W, 3), dtype=np.uint8, buffer=shm.buf)
-        frame_counter = Value('i', 0)
-        cam_proc      = Process(
-            target=_camera_process,
-            args=(shm.name, frame_counter, stop_event, 0, 15),
-            daemon=True,
+        liveview_script = Path(__file__).parent / 'liveview.py'
+        liveview_proc   = subprocess.Popen(
+            [sys.executable, str(liveview_script), '--index', '0', '--fps', '15'],
+            stdin=subprocess.PIPE,
         )
-        cam_proc.start()
+        from hardware.camera_controller import CameraController
+        cam = CameraController(index=0, fps=15)
+        cam.start()
 
     # ── robot ─────────────────────────────────────────────────────────────────
     robot = None
@@ -503,7 +383,8 @@ def main():
             goal_image,
             vae, encoder, projector, delta_embedder, ldp,
             robot,
-            shm_arr,
+            cam,
+            liveview_proc,
             device=device,
             max_steps=args.steps,
             goal_threshold=args.threshold,
@@ -526,13 +407,11 @@ def main():
                     robot.move_axis_by(ax, -total)
             print('Homing complete.')
     finally:
-        cv2.destroyAllWindows()
-        stop_event.set()
-        if cam_proc is not None:
-            cam_proc.join(timeout=3)
-        if shm is not None:
-            shm.close()
-            shm.unlink()
+        if liveview_proc is not None:
+            liveview_proc.terminate()
+            liveview_proc.wait()
+        if cam is not None:
+            cam.stop()
         if robot is not None:
             robot.disconnect()
 
