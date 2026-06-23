@@ -3,7 +3,7 @@ Manual keyboard control for the nanochemistry transfer stage.
 
 The camera liveview runs as a completely separate subprocess (liveview.py) so it
 never pauses or freezes regardless of what the main process is doing.
-Keyboard input is handled via msvcrt on Windows (no cv2 window needed in main).
+Keyboard input is handled via pynput (no cv2 window needed in main).
 
 Keys:
     Arrow Up    — move Y forward
@@ -20,11 +20,13 @@ Keys:
 from __future__ import annotations
 
 import argparse
+import queue
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-import msvcrt   # Windows only
+from pynput import keyboard as pynput_kb
 
 sys.path.insert(0, str(Path(__file__).parent))
 from hardware.transfer_control_controller import TransferControl
@@ -36,12 +38,6 @@ SCALE_STEP   = 0.1
 SCALE_MIN    = 0.1
 SCALE_MAX    = 10.0
 
-# Windows extended key scan codes (second byte after 0xe0 / 0x00 prefix)
-_ARROW_UP    = 72
-_ARROW_DOWN  = 80
-_ARROW_LEFT  = 75
-_ARROW_RIGHT = 77
-
 
 def parse_args():
     p = argparse.ArgumentParser(description='Manual transfer stage controller.')
@@ -52,37 +48,42 @@ def parse_args():
     return p.parse_args()
 
 
-def read_key() -> str | None:
+# ── keyboard listener ─────────────────────────────────────────────────────────
+
+def make_key_queue() -> tuple[queue.Queue, pynput_kb.Listener]:
     """
-    Non-blocking key read via msvcrt.
-    Returns a string token: 'up', 'down', 'left', 'right', 'q', 'e',
-    '=', '-', 'h', 'esc', or None if no key is waiting.
+    Returns (q, listener).  Each key press pushes a token string onto q:
+      'up' | 'down' | 'left' | 'right' | 'q' | 'e' | '=' | '-' | 'h' | 'esc'
+    Start listener.start() before using q.
     """
-    if not msvcrt.kbhit():
-        return None
+    q = queue.Queue()
 
-    ch = msvcrt.getch()
+    _SPECIAL = {
+        pynput_kb.Key.up:    'up',
+        pynput_kb.Key.down:  'down',
+        pynput_kb.Key.left:  'left',
+        pynput_kb.Key.right: 'right',
+        pynput_kb.Key.esc:   'esc',
+    }
+    _CHARS = {'q', 'e', 'h', '=', '+', '-'}
 
-    # Arrow keys arrive as two bytes: 0xe0 or 0x00 followed by a scan code
-    if ch in (b'\xe0', b'\x00'):
-        scan = ord(msvcrt.getch())
-        return {
-            _ARROW_UP:    'up',
-            _ARROW_DOWN:  'down',
-            _ARROW_LEFT:  'left',
-            _ARROW_RIGHT: 'right',
-        }.get(scan)
+    def on_press(key):
+        token = _SPECIAL.get(key)
+        if token is None:
+            try:
+                c = key.char.lower() if key.char else None
+                if c in _CHARS:
+                    token = '=' if c == '+' else c
+            except AttributeError:
+                pass
+        if token:
+            q.put(token)
 
-    c = ch.lower()
-    if c == b'\x1b':  return 'esc'
-    if c == b'\x03':  return 'esc'   # Ctrl-C
-    if c == b'q':     return 'q'
-    if c == b'e':     return 'e'
-    if c == b'h':     return 'h'
-    if c in (b'=', b'+'): return '='
-    if c == b'-':     return '-'
-    return None
+    listener = pynput_kb.Listener(on_press=on_press)
+    return q, listener
 
+
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def print_status(scale: float, step: float, cumulative: dict):
     eff = step * scale
@@ -92,6 +93,8 @@ def print_status(scale: float, step: float, cumulative: dict):
         end='', flush=True,
     )
 
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     args  = parse_args()
@@ -130,13 +133,18 @@ def main():
                 cumulative[ax] = 0.0
         print('Homing complete.')
 
-    print('Ready.  Arrows/WASD=XY  Q/E=Z  =/−=scale  H=home  ESC=quit')
+    # ── start keyboard listener ────────────────────────────────────────────────
+    key_q, listener = make_key_queue()
+    listener.start()
+
+    print('Ready.  Arrows=XY  Q/E=Z  =/−=scale  H=home  ESC=quit')
     print_status(scale, step, cumulative)
 
     try:
         while True:
-            key = read_key()
-            if key is None:
+            try:
+                key = key_q.get(timeout=0.05)
+            except queue.Empty:
                 continue
 
             if   key == 'up':    move('y',  step)
@@ -160,6 +168,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        listener.stop()
         home()
         liveview_proc.terminate()
         liveview_proc.wait()
