@@ -78,9 +78,38 @@ def build_model(device: str):
     return vae, encoder, projector, delta_embedder, ldp
 
 
+def _remap_encoder_keys(sd: dict) -> dict:
+    """Remap checkpoint keys from older transformers naming to current ViTModel naming.
+
+    Older: layers.N.attention.q_proj / k_proj / v_proj / o_proj / mlp.fc1 / mlp.fc2
+    Current: encoder.layer.N.attention.attention.query / key / value /
+             attention.output.dense / intermediate.dense / output.dense
+    """
+    import re
+    subst = [
+        ('attention.q_proj',    'attention.attention.query'),
+        ('attention.k_proj',    'attention.attention.key'),
+        ('attention.v_proj',    'attention.attention.value'),
+        ('attention.o_proj',    'attention.output.dense'),
+        ('mlp.fc1',             'intermediate.dense'),
+        ('mlp.fc2',             'output.dense'),
+    ]
+    new_sd = {}
+    for k, v in sd.items():
+        new_k = re.sub(r'^layers\.(\d+)\.', r'encoder.layer.\1.', k)
+        for old, new in subst:
+            new_k = new_k.replace(old, new)
+        new_sd[new_k] = v
+    return new_sd
+
+
 def load_checkpoint(ckpt_path: Path, encoder, projector, delta_embedder, ldp, device: str):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    encoder.load_state_dict(ckpt['encoder'])
+    enc_sd = ckpt['encoder']
+    # detect old key scheme and remap if necessary
+    if any(k.startswith('layers.') for k in enc_sd):
+        enc_sd = _remap_encoder_keys(enc_sd)
+    encoder.load_state_dict(enc_sd)
     projector.load_state_dict(ckpt['projector'])
     delta_embedder.load_state_dict(ckpt['delta_embedder'])
     ldp.load_state_dict(ckpt['ldp'])
@@ -209,7 +238,7 @@ def draw_overlay(
         cv2.circle(canvas, pts[-1], 2, (80, 80, 80), -1)
 
     # ── draw best (mean) trajectory (bright green + step dots) ───────────────
-    best_np = best_actions.numpy()                     # (horizon, 3)
+    best_np = best_actions.cpu().numpy()                     # (horizon, 3)
     pts = [(cx, cy)]
     for dx, dy, dz in best_np:
         px = int(pts[-1][0] + dx * sx)
