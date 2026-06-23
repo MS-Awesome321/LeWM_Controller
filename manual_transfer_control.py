@@ -1,6 +1,10 @@
 """
 Manual keyboard control for the nanochemistry transfer stage with live camera view.
 
+The camera runs in a completely separate process and writes frames into a shared
+memory block.  The main process reads from shared memory and handles the cv2
+window + keyboard + robot moves — no GIL contention, no thread scheduling jitter.
+
 Keys:
     Arrow Up    — move Y forward
     Arrow Down  — move Y backward
@@ -8,7 +12,7 @@ Keys:
     Arrow Right — move X right
     Q           — move Z up
     E           — move Z down
-    =           — increase ACTION_SCALE by 0.1
+    =  /  +     — increase ACTION_SCALE by 0.1
     -           — decrease ACTION_SCALE by 0.1 (min 0.1)
     ESC / Ctrl-C — home and exit
 """
@@ -16,84 +20,86 @@ from __future__ import annotations
 
 import argparse
 import sys
-import threading
 import time
+from multiprocessing import Process, Value, Event
+from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from hardware.camera_controller import CameraController
-from hardware.transfer_control_controller import TransferControl
 
 # ── constants ─────────────────────────────────────────────────────────────────
-STEP_MM       = 1.0    # base step size in mm
-ACTION_SCALE  = 0.1    # multiplied against STEP_MM; change with = / -
-SCALE_STEP    = 0.1    # how much = / - adjusts ACTION_SCALE
-SCALE_MIN     = 0.1
-SCALE_MAX     = 10.0
-WIN_TITLE     = 'Manual Transfer Control'
-WIN_W, WIN_H  = 800, 600
+STEP_MM      = 1.0
+ACTION_SCALE = 0.1
+SCALE_STEP   = 0.1
+SCALE_MIN    = 0.1
+SCALE_MAX    = 10.0
+WIN_TITLE    = 'Manual Transfer Control'
+WIN_W, WIN_H = 800, 600
 
-# cv2 special key codes (platform-dependent; these work on Windows and Linux)
-KEY_UP    = 2490368   # Windows
-KEY_DOWN  = 2621440
-KEY_LEFT  = 2424832
-KEY_RIGHT = 2555904
-KEY_UP_L  = 82        # Linux / macOS (lowercase)
-KEY_DOWN_L  = 84
-KEY_LEFT_L  = 81
-KEY_RIGHT_L = 83
+# Shared-memory frame shape: camera native size (resized when displaying)
+CAM_H, CAM_W = 480, 640   # adjust if your camera uses a different resolution
 
+# cv2 arrow key codes — Windows extended codes and Linux/macOS single-byte codes
+KEY_UP     = 2490368;  KEY_UP_L    = 82
+KEY_DOWN   = 2621440;  KEY_DOWN_L  = 84
+KEY_LEFT   = 2424832;  KEY_LEFT_L  = 81
+KEY_RIGHT  = 2555904;  KEY_RIGHT_L = 83
+
+
+# ── camera process ────────────────────────────────────────────────────────────
+
+def _camera_process(shm_name: str, frame_counter,
+                    stop_event, cam_index: int, cam_fps: int):
+    """
+    Runs in a separate process.  Continuously snaps frames and writes them into
+    the named SharedMemory block, then increments frame_counter so the reader
+    knows a new frame is available.
+    """
+    from hardware.camera_controller import CameraController
+
+    buf = SharedMemory(name=shm_name)
+    arr = np.ndarray((CAM_H, CAM_W, 3), dtype=np.uint8, buffer=buf.buf)
+
+    cam = CameraController(index=cam_index, fps=cam_fps)
+    cam.start()
+    try:
+        while not stop_event.is_set():
+            try:
+                bgr = cam.snap()                     # (H, W, 3) BGR uint8
+                if bgr.shape[:2] != (CAM_H, CAM_W):
+                    bgr = cv2.resize(bgr, (CAM_W, CAM_H))
+                np.copyto(arr, bgr)
+                with frame_counter.get_lock():
+                    frame_counter.value += 1
+            except Exception:
+                pass
+    finally:
+        cam.stop()
+        buf.close()
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(description='Manual transfer stage controller.')
-    p.add_argument('--fps',      type=int,   default=15,  help='Camera FPS')
-    p.add_argument('--index',    type=int,   default=0,   help='Camera device index')
+    p.add_argument('--fps',      type=int,   default=15)
+    p.add_argument('--index',    type=int,   default=0)
     p.add_argument('--step',     type=float, default=STEP_MM, help='Base step size (mm)')
-    p.add_argument('--no_robot', action='store_true', help='Camera only, no robot connection')
+    p.add_argument('--no_robot', action='store_true', help='Camera only, no robot')
     return p.parse_args()
 
 
-# ── camera thread ─────────────────────────────────────────────────────────────
-
-class CameraThread(threading.Thread):
-    """Grabs frames from the camera and exposes the latest one thread-safely."""
-
-    def __init__(self, camera: CameraController):
-        super().__init__(daemon=True)
-        self._camera   = camera
-        self._lock     = threading.Lock()
-        self._frame    = np.zeros((WIN_H, WIN_W, 3), dtype=np.uint8)
-        self._stop_evt = threading.Event()
-
-    def run(self):
-        while not self._stop_evt.is_set():
-            try:
-                bgr = self._camera.snap()
-                with self._lock:
-                    self._frame = bgr
-            except Exception:
-                pass
-
-    def latest(self) -> np.ndarray:
-        with self._lock:
-            return self._frame.copy()
-
-    def stop(self):
-        self._stop_evt.set()
-
-
-# ── overlay ───────────────────────────────────────────────────────────────────
-
-def draw_hud(frame: np.ndarray, scale: float, cumulative: dict, step_mm: float) -> np.ndarray:
-    canvas = cv2.resize(frame, (WIN_W, WIN_H))
+def draw_hud(frame_bgr: np.ndarray, scale: float,
+             cumulative: dict, step_mm: float) -> np.ndarray:
+    canvas = cv2.resize(frame_bgr, (WIN_W, WIN_H))
     effective = step_mm * scale
     lines = [
-        f'ACTION_SCALE: {scale:.1f}  (step = {effective:.3f} mm)',
+        f'ACTION_SCALE: {scale:.1f}   step = {effective:.3f} mm',
         f'Cumulative:  x={cumulative["x"]:+.3f}  y={cumulative["y"]:+.3f}  z={cumulative["z"]:+.3f} mm',
-        'Arrows=XY  Q/E=Z  =/- scale  ESC=home+quit',
+        'Arrows / WASD = XY   Q/E = Z   =/- = scale   ESC = home + quit',
     ]
     for i, text in enumerate(lines):
         y = WIN_H - 20 - (len(lines) - 1 - i) * 22
@@ -112,13 +118,24 @@ def main():
     step  = args.step
     cumulative = {'x': 0.0, 'y': 0.0, 'z': 0.0}
 
-    camera = CameraController(index=args.index, fps=args.fps)
-    camera.start()
-    cam_thread = CameraThread(camera)
-    cam_thread.start()
+    # ── shared memory for camera frames ───────────────────────────────────────
+    frame_bytes   = CAM_H * CAM_W * 3
+    shm           = SharedMemory(create=True, size=frame_bytes)
+    shm_arr       = np.ndarray((CAM_H, CAM_W, 3), dtype=np.uint8, buffer=shm.buf)
+    frame_counter = Value('i', 0)
+    stop_event    = Event()
 
+    cam_proc = Process(
+        target=_camera_process,
+        args=(shm.name, frame_counter, stop_event, args.index, args.fps),
+        daemon=True,
+    )
+    cam_proc.start()
+
+    # ── robot ──────────────────────────────────────────────────────────────────
     robot = None
     if not args.no_robot:
+        from hardware.transfer_control_controller import TransferControl
         robot = TransferControl()
         print('Robot connected.')
 
@@ -140,35 +157,43 @@ def main():
                 cumulative[ax] = 0.0
         print('Homing complete.')
 
+    # ── UI loop ───────────────────────────────────────────────────────────────
     cv2.namedWindow(WIN_TITLE, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WIN_TITLE, WIN_W, WIN_H)
-    print('Ready. Use arrow keys / Q / E to move. ESC to home and quit.')
+    print('Ready.  Arrow keys / WASD = XY,  Q/E = Z,  =/- = scale,  ESC = quit.')
 
+    last_seen = -1
     try:
         while True:
-            frame  = cam_thread.latest()
+            # read latest frame if the camera process wrote a new one
+            with frame_counter.get_lock():
+                current = frame_counter.value
+            if current != last_seen:
+                frame    = shm_arr.copy()   # snapshot — camera process may overwrite
+                last_seen = current
+
             canvas = draw_hud(frame, scale, cumulative, step)
             cv2.imshow(WIN_TITLE, canvas)
 
-            key = cv2.waitKey(30) & 0xFFFFFF  # 30 ms poll → ~33 fps UI
+            key = cv2.waitKey(30) & 0xFFFFFF
 
-            if key == 255 or key == -1:        # no key
+            if key in (255, 0xFFFFFF):
                 continue
-            if key == 27:                      # ESC
+            if key == 27:                    # ESC
                 break
 
-            key_low = key & 0xFF               # strip modifiers for letter keys
+            kl = key & 0xFF                  # single-byte value for letter keys
 
-            if   key in (KEY_UP,    KEY_UP_L)    or key_low == ord('w'): move('y',  step)
-            elif key in (KEY_DOWN,  KEY_DOWN_L)  or key_low == ord('s'): move('y', -step)
-            elif key in (KEY_LEFT,  KEY_LEFT_L)  or key_low == ord('a'): move('x', -step)
-            elif key in (KEY_RIGHT, KEY_RIGHT_L) or key_low == ord('d'): move('x',  step)
-            elif key_low == ord('q'):                                      move('z',  step)
-            elif key_low == ord('e'):                                      move('z', -step)
-            elif key_low == ord('=') or key_low == ord('+'):
+            if   key in (KEY_UP,    KEY_UP_L)    or kl == ord('w'): move('y',  step)
+            elif key in (KEY_DOWN,  KEY_DOWN_L)  or kl == ord('s'): move('y', -step)
+            elif key in (KEY_LEFT,  KEY_LEFT_L)  or kl == ord('a'): move('x', -step)
+            elif key in (KEY_RIGHT, KEY_RIGHT_L) or kl == ord('d'): move('x',  step)
+            elif kl == ord('q'):                                      move('z',  step)
+            elif kl == ord('e'):                                      move('z', -step)
+            elif kl in (ord('='), ord('+')):
                 scale = min(SCALE_MAX, round(scale + SCALE_STEP, 10))
                 print(f'  ACTION_SCALE → {scale:.1f}')
-            elif key_low == ord('-'):
+            elif kl == ord('-'):
                 scale = max(SCALE_MIN, round(scale - SCALE_STEP, 10))
                 print(f'  ACTION_SCALE → {scale:.1f}')
 
@@ -176,9 +201,11 @@ def main():
         pass
     finally:
         home()
-        cam_thread.stop()
+        stop_event.set()
+        cam_proc.join(timeout=3)
         cv2.destroyAllWindows()
-        camera.stop()
+        shm.close()
+        shm.unlink()
         if robot is not None:
             robot.disconnect()
         print('Done.')

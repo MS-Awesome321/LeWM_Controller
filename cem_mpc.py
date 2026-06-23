@@ -19,6 +19,8 @@ import argparse
 import sys
 import threading
 import time
+from multiprocessing import Process, Value, Event
+from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 
 import cv2
@@ -188,13 +190,44 @@ def cem_plan(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Camera capture
+# Camera process + shared-memory helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def capture_frame(cam) -> np.ndarray:
-    """Returns (H, W, 3) uint8 RGB from a CameraController instance."""
-    bgr = cam.snap()                          # CameraController.snap() → BGR uint8
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+CAM_H, CAM_W = 480, 640   # native capture resolution (resized to IMG_SIZE for the model)
+
+
+def _camera_process(shm_name: str, frame_counter, stop_event,
+                    cam_index: int = 0, cam_fps: int = 15):
+    """
+    Runs in a separate process.  Continuously snaps frames and writes them into
+    the named SharedMemory block, then increments frame_counter.
+    """
+    from hardware.camera_controller import CameraController
+
+    buf = SharedMemory(name=shm_name)
+    arr = np.ndarray((CAM_H, CAM_W, 3), dtype=np.uint8, buffer=buf.buf)
+
+    cam = CameraController(index=cam_index, fps=cam_fps)
+    cam.start()
+    try:
+        while not stop_event.is_set():
+            try:
+                bgr = cam.snap()
+                if bgr.shape[:2] != (CAM_H, CAM_W):
+                    bgr = cv2.resize(bgr, (CAM_W, CAM_H))
+                np.copyto(arr, bgr)
+                with frame_counter.get_lock():
+                    frame_counter.value += 1
+            except Exception:
+                pass
+    finally:
+        cam.stop()
+        buf.close()
+
+
+def read_shared_frame(shm_arr: np.ndarray) -> np.ndarray:
+    """Snapshot the shared frame and return it as (H, W, 3) uint8 RGB."""
+    return cv2.cvtColor(shm_arr.copy(), cv2.COLOR_BGR2RGB)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,32 +311,29 @@ def draw_overlay(
 # MPC loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _pump_camera_during_move(camera, stop_event: threading.Event) -> None:
-    """Continuously capture and display frames until stop_event is set."""
+def _pump_camera_during_move(shm_arr: np.ndarray, stop_event: threading.Event) -> None:
+    """Display live frames from shared memory until stop_event is set."""
     while not stop_event.is_set():
-        try:
-            frame = capture_frame(camera)
-            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            bgr = cv2.resize(bgr, (800, 600))
-            cv2.putText(bgr, 'Moving...', (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
-            cv2.putText(bgr, 'Moving...', (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
-            cv2.imshow('CEM-MPC  |  elite plans', bgr)
-            cv2.waitKey(1)
-        except Exception:
-            break
+        frame = read_shared_frame(shm_arr)
+        bgr   = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        bgr   = cv2.resize(bgr, (800, 600))
+        cv2.putText(bgr, 'Moving...', (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(bgr, 'Moving...', (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
+        cv2.imshow('CEM-MPC  |  elite plans', bgr)
+        cv2.waitKey(1)
 
 
 def run_mpc(
-    goal_image:      np.ndarray,   # (H, W, 3) uint8 RGB
+    goal_image:      np.ndarray,    # (H, W, 3) uint8 RGB
     vae, encoder, projector, delta_embedder, ldp,
-    robot,                         # TransferControl instance (or None for dry-run / no-motion)
-    camera,                        # CameraController instance (or None for dry-run)
+    robot,                          # TransferControl instance (or None)
+    shm_arr:         np.ndarray | None,  # numpy view into shared camera memory (or None for dry-run)
     *,
     device:          str   = 'cpu',
     max_steps:       int   = 50,
-    goal_threshold:  float = 2.0,  # stop when embedding L2 < this
+    goal_threshold:  float = 2.0,
     horizon:         int   = 10,
     n_samples:       int   = 512,
     n_elite:         int   = 64,
@@ -311,26 +341,25 @@ def run_mpc(
     action_std:      float = 3.0,
     action_min:      float = -10.0,
     action_max:      float =  10.0,
-    action_scale:    float = 1.0,  # multiplier applied to each action before sending
+    action_scale:    float = 1.0,
     axes:            tuple = ('x', 'y', 'z'),
-    settle_s:        float = 0.5,  # seconds to wait after each move
+    settle_s:        float = 0.5,
 ) -> dict:
     """
-    MPC loop: capture live frame → plan → execute first action → repeat.
+    MPC loop: read shared-memory frame → plan → execute first action → repeat.
 
-    Returns a dict mapping axis name → total displacement sent (mm), so the
-    caller can home the robot by negating and replaying these values.
-    If robot/camera are None (dry-run), a black frame is used and no moves occur.
+    Returns cumulative displacement per axis so the caller can home on interrupt.
+    shm_arr=None triggers dry-run (black frame, no robot moves).
     """
     goal_emb = frame_to_embedding(goal_image, vae, encoder, projector, device)
     print(f'Goal embedding norm: {goal_emb.norm().item():.3f}')
 
-    cumulative = {ax: 0.0 for ax in axes}  # track total displacement for homing
+    cumulative = {ax: 0.0 for ax in axes}
 
     for step in range(max_steps):
         # ── observe ───────────────────────────────────────────────────────────
-        if camera is not None:
-            frame = capture_frame(camera)
+        if shm_arr is not None:
+            frame = read_shared_frame(shm_arr)
         else:
             frame = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
 
@@ -356,14 +385,13 @@ def run_mpc(
         draw_overlay(frame, elite_actions, best_actions, dist, step + 1)
 
         # ── execute first action ───────────────────────────────────────────────
-        raw_action = best_actions[0].cpu().numpy()          # (3,) — [Δx, Δy, Δz] in mm
+        raw_action = best_actions[0].cpu().numpy()   # (3,) [Δx, Δy, Δz] mm
         action     = raw_action * action_scale
 
         if robot is not None:
-            # pump camera in a background thread while motors are moving
-            stop_evt = threading.Event()
+            stop_evt    = threading.Event()
             pump_thread = threading.Thread(
-                target=_pump_camera_during_move, args=(camera, stop_evt), daemon=True
+                target=_pump_camera_during_move, args=(shm_arr, stop_evt), daemon=True
             )
             pump_thread.start()
             for ax, delta in zip(axes, action):
@@ -440,19 +468,33 @@ def main():
 
     goal_image = read_rgb(args.goal)
 
-    # ── connect robot ─────────────────────────────────────────────────────────
-    robot  = None
-    camera = None
+    # ── camera process + shared memory ────────────────────────────────────────
+    shm       = None
+    shm_arr   = None
+    cam_proc  = None
+    stop_event = Event()
+
     if not args.dry_run:
-        from hardware.camera_controller import CameraController
-        camera = CameraController(index=0, fps=15)
-        camera.start()
-        if args.no_motion:
-            print('Camera connected (no-motion mode — moves will be skipped).')
-        else:
-            from hardware.transfer_control_controller import TransferControl
-            robot = TransferControl()
-            print('Robot and camera connected.')
+        frame_bytes   = CAM_H * CAM_W * 3
+        shm           = SharedMemory(create=True, size=frame_bytes)
+        shm_arr       = np.ndarray((CAM_H, CAM_W, 3), dtype=np.uint8, buffer=shm.buf)
+        frame_counter = Value('i', 0)
+        cam_proc      = Process(
+            target=_camera_process,
+            args=(shm.name, frame_counter, stop_event, 0, 15),
+            daemon=True,
+        )
+        cam_proc.start()
+
+    # ── robot ─────────────────────────────────────────────────────────────────
+    robot = None
+    if not args.dry_run and not args.no_motion:
+        from hardware.transfer_control_controller import TransferControl
+        robot = TransferControl()
+        print('Robot connected.')
+
+    if args.no_motion:
+        print('No-motion mode — camera live, moves skipped.')
 
     # ── run ───────────────────────────────────────────────────────────────────
     cumulative = {ax: 0.0 for ax in ('x', 'y', 'z')}
@@ -461,7 +503,7 @@ def main():
             goal_image,
             vae, encoder, projector, delta_embedder, ldp,
             robot,
-            camera,
+            shm_arr,
             device=device,
             max_steps=args.steps,
             goal_threshold=args.threshold,
@@ -485,10 +527,14 @@ def main():
             print('Homing complete.')
     finally:
         cv2.destroyAllWindows()
+        stop_event.set()
+        if cam_proc is not None:
+            cam_proc.join(timeout=3)
+        if shm is not None:
+            shm.close()
+            shm.unlink()
         if robot is not None:
             robot.disconnect()
-        if camera is not None:
-            camera.stop()
 
 
 if __name__ == '__main__':
