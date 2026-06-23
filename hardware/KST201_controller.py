@@ -111,6 +111,15 @@ class KST201:
         self.dev.MoveJog(direction, int(timeout_ms))
         self._wait_stop(timeout_s=timeout_ms / 1000)
 
+    def start_jog(self, direction: str) -> None:
+        """Start continuous jog without blocking. direction: 'forward' or 'backward'."""
+        d = MotorDirection.Forward if direction == 'forward' else MotorDirection.Backward
+        self.dev.MoveJog(d)
+
+    def stop(self) -> None:
+        """Stop motion immediately."""
+        self.dev.StopImmediate()
+
     def set_speed(self, max_vel: float, accel: float, min_vel: float = 0.0):
         """
         Set velocity profile for MoveTo / MoveRelative.

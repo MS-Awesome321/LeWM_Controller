@@ -138,6 +138,22 @@ class TransferControl:
         else:
             axis_obj.move_by(float(delta))
 
+    def start_jog_axis(self, axis: str, direction: str) -> None:
+        """Start continuous non-blocking jog on a KST201 axis. direction: 'forward'|'backward'."""
+        self._require_ready()
+        axis_key = axis.lower()
+        if axis_key not in {'x', 'y', 'z'}:
+            raise ValueError("start_jog_axis only supported on x/y/z (KST201) axes.")
+        self._get_axis(axis).start_jog(direction)
+
+    def stop_axis(self, axis: str) -> None:
+        """Stop a KST201 axis immediately."""
+        self._require_ready()
+        axis_key = axis.lower()
+        if axis_key not in {'x', 'y', 'z'}:
+            raise ValueError("stop_axis only supported on x/y/z (KST201) axes.")
+        self._get_axis(axis).stop()
+
     def jog_axis(self, axis: str, step: float) -> None:
         self._require_ready()
         axis_key = axis.lower()
