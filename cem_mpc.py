@@ -107,8 +107,8 @@ def load_checkpoint(ckpt_path: Path, encoder, projector, delta_embedder, ldp, de
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     enc_sd = ckpt['encoder']
     # detect old key scheme and remap if necessary
-    if any(k.startswith('layers.') for k in enc_sd):
-        enc_sd = _remap_encoder_keys(enc_sd)
+    # if any(k.startswith('layers.') for k in enc_sd):
+    #     enc_sd = _remap_encoder_keys(enc_sd)
     encoder.load_state_dict(enc_sd)
     projector.load_state_dict(ckpt['projector'])
     delta_embedder.load_state_dict(ckpt['delta_embedder'])
@@ -147,8 +147,8 @@ def cem_plan(
     n_elite:      int   = 64,
     n_iters:      int   = 5,
     action_std:   float = 3.0,     # mm — initial sampling std
-    action_min:   float = -10.0,   # mm — per-step clamp
-    action_max:   float =  10.0,
+    action_min:   float = -1e-2,   # mm — per-step clamp
+    action_max:   float =  1e-2,
     device:       str   = 'cpu',
 ) -> tuple[torch.Tensor, float]:
     """
@@ -436,6 +436,13 @@ def main():
             action_max=args.max_step,
             settle_s=args.settle,
         )
+    except KeyboardInterrupt:
+        cv2.destroyAllWindows()
+        if robot is not None:
+            robot.disconnect()
+        if camera is not None:
+            camera.stop()
+
     finally:
         cv2.destroyAllWindows()
         if robot is not None:

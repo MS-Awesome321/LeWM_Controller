@@ -300,7 +300,7 @@ class CameraController:
     def _get_latest_frame(self) -> np.ndarray | None:
         """Get the most recent frame."""
         with self._lock:
-            return None if self._latest is None else self._latest.copy()
+            return None if self._latest is None else cv2.flip(self._latest.copy(), 0)
 
     # ========== Live view methods ========== #
 
@@ -392,7 +392,7 @@ class CameraController:
             frame = self._get_latest_frame()
             if frame is not None:
                 os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-                ok = cv2.imwrite(path, frame)
+                ok = cv2.imwrite(path,frame)
                 if not ok:
                     raise IOError(f"Failed to write image: {path}")
                 return os.path.abspath(path)
