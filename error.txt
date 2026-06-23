@@ -1,8 +1,1 @@
-Traceback (most recent call last):
-  File "C:\Users\Qumus_PC\Desktop\LeWM_Controller\cem_mpc.py", line 25, in <module>
-    import torch
-  File "C:\Users\Qumus_PC\AppData\Roaming\Python\Python312\site-packages\torch\__init__.py", line 287, in <module>
-    _load_dll_libraries()
-  File "C:\Users\Qumus_PC\AppData\Roaming\Python\Python312\site-packages\torch\__init__.py", line 270, in _load_dll_libraries
-    raise err
-OSError: [WinError 1114] A dynamic link library (DLL) initialization routine failed. Error loading "C:\Users\Qumus_PC\AppData\Roaming\Python\Python312\site-packages\torch\lib\c10.dll" or one of its dependencies.
+TypeError: No method matches given arguments for GenericAdvancedMotorCLI.MoveJog: (<class 'Thorlabs.MotionControl.GenericMotorCLI.MotorDirection'>)
