@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -277,10 +278,27 @@ def draw_overlay(
 # MPC loop
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _pump_camera_during_move(camera, stop_event: threading.Event) -> None:
+    """Continuously capture and display frames until stop_event is set."""
+    while not stop_event.is_set():
+        try:
+            frame = capture_frame(camera)
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            bgr = cv2.resize(bgr, (800, 600))
+            cv2.putText(bgr, 'Moving...', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(bgr, 'Moving...', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
+            cv2.imshow('CEM-MPC  |  elite plans', bgr)
+            cv2.waitKey(1)
+        except Exception:
+            break
+
+
 def run_mpc(
     goal_image:      np.ndarray,   # (H, W, 3) uint8 RGB
     vae, encoder, projector, delta_embedder, ldp,
-    robot,                         # TransferControl instance (or None for dry-run)
+    robot,                         # TransferControl instance (or None for dry-run / no-motion)
     camera,                        # CameraController instance (or None for dry-run)
     *,
     device:          str   = 'cpu',
@@ -293,24 +311,27 @@ def run_mpc(
     action_std:      float = 3.0,
     action_min:      float = -10.0,
     action_max:      float =  10.0,
+    action_scale:    float = 1.0,  # multiplier applied to each action before sending
     axes:            tuple = ('x', 'y', 'z'),
     settle_s:        float = 0.5,  # seconds to wait after each move
-):
+) -> dict:
     """
     MPC loop: capture live frame → plan → execute first action → repeat.
 
-    If `robot` and `camera` are None (dry-run), a random embedding is used as
-    the current state so the planning logic can still be exercised.
+    Returns a dict mapping axis name → total displacement sent (mm), so the
+    caller can home the robot by negating and replaying these values.
+    If robot/camera are None (dry-run), a black frame is used and no moves occur.
     """
     goal_emb = frame_to_embedding(goal_image, vae, encoder, projector, device)
     print(f'Goal embedding norm: {goal_emb.norm().item():.3f}')
+
+    cumulative = {ax: 0.0 for ax in axes}  # track total displacement for homing
 
     for step in range(max_steps):
         # ── observe ───────────────────────────────────────────────────────────
         if camera is not None:
             frame = capture_frame(camera)
         else:
-            # dry-run: synthesise a dummy observation so planning still runs
             frame = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
 
         current_emb = frame_to_embedding(frame, vae, encoder, projector, device)
@@ -335,17 +356,31 @@ def run_mpc(
         draw_overlay(frame, elite_actions, best_actions, dist, step + 1)
 
         # ── execute first action ───────────────────────────────────────────────
-        action = best_actions[0].cpu().numpy()  # (3,) — [Δx, Δy, Δz] in mm
-        for ax, delta in zip(axes, action):
-            print(f'  move {ax} by {delta:+.3f} mm')
-            if robot is not None:
-                robot.move_axis_by(ax, float(delta))
+        raw_action = best_actions[0].cpu().numpy()          # (3,) — [Δx, Δy, Δz] in mm
+        action     = raw_action * action_scale
 
         if robot is not None:
+            # pump camera in a background thread while motors are moving
+            stop_evt = threading.Event()
+            pump_thread = threading.Thread(
+                target=_pump_camera_during_move, args=(camera, stop_evt), daemon=True
+            )
+            pump_thread.start()
+            for ax, delta in zip(axes, action):
+                print(f'  move {ax} by {delta:+.3f} mm  (raw {raw_action[list(axes).index(ax)]:+.3f} × {action_scale})')
+                robot.move_axis_by(ax, float(delta))
+                cumulative[ax] += float(delta)
             time.sleep(settle_s)
+            stop_evt.set()
+            pump_thread.join()
+        else:
+            for ax, delta in zip(axes, action):
+                print(f'  move {ax} by {delta:+.3f} mm  (no-op)')
 
     else:
         print('Max steps reached without converging.')
+
+    return cumulative
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,6 +407,8 @@ def parse_args():
 
 
 def main():
+    ACTION_SCALE = 0.01
+
     args = parse_args()
 
     if torch.cuda.is_available():
@@ -418,8 +455,9 @@ def main():
             print('Robot and camera connected.')
 
     # ── run ───────────────────────────────────────────────────────────────────
+    cumulative = {ax: 0.0 for ax in ('x', 'y', 'z')}
     try:
-        run_mpc(
+        cumulative = run_mpc(
             goal_image,
             vae, encoder, projector, delta_embedder, ldp,
             robot,
@@ -434,15 +472,17 @@ def main():
             action_std=args.std,
             action_min=-args.max_step,
             action_max=args.max_step,
+            action_scale=ACTION_SCALE,
             settle_s=args.settle,
         )
     except KeyboardInterrupt:
-        cv2.destroyAllWindows()
+        print('\nInterrupted — homing robot to start position...')
         if robot is not None:
-            robot.disconnect()
-        if camera is not None:
-            camera.stop()
-
+            for ax, total in cumulative.items():
+                if total != 0.0:
+                    print(f'  return {ax} by {-total:+.3f} mm')
+                    robot.move_axis_by(ax, -total)
+            print('Homing complete.')
     finally:
         cv2.destroyAllWindows()
         if robot is not None:
