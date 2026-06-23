@@ -357,7 +357,8 @@ def parse_args():
     p.add_argument('--goal',     required=True,  help='Path to goal frame image')
     p.add_argument('--ckpt',     default=None,   help='Path to JEPA checkpoint (.pt). '
                                                        'Defaults to latest in checkpoints/')
-    p.add_argument('--dry_run',  action='store_true', help='Plan but do not move robot')
+    p.add_argument('--dry_run',   action='store_true', help='Plan with dummy frame, no robot/camera')
+    p.add_argument('--no_motion', action='store_true', help='Use live camera but skip robot moves')
     p.add_argument('--horizon',  type=int,   default=10)
     p.add_argument('--samples',  type=int,   default=512)
     p.add_argument('--elite',    type=int,   default=64)
@@ -406,13 +407,15 @@ def main():
     robot  = None
     camera = None
     if not args.dry_run:
-        # import here so the script still runs on non-Windows machines in dry-run mode
-        from hardware.transfer_control_controller import TransferControl
         from hardware.camera_controller import CameraController
-        robot  = TransferControl()
         camera = CameraController(index=0, fps=15)
         camera.start()
-        print('Robot and camera connected.')
+        if args.no_motion:
+            print('Camera connected (no-motion mode — moves will be skipped).')
+        else:
+            from hardware.transfer_control_controller import TransferControl
+            robot = TransferControl()
+            print('Robot and camera connected.')
 
     # ── run ───────────────────────────────────────────────────────────────────
     try:
