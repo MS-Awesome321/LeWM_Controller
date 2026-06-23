@@ -20,13 +20,11 @@ Keys:
 from __future__ import annotations
 
 import argparse
-import queue
 import subprocess
 import sys
-import time
 from pathlib import Path
 
-from pynput import keyboard as pynput_kb
+from pynput.keyboard import Events, Key
 
 sys.path.insert(0, str(Path(__file__).parent))
 from hardware.transfer_control_controller import TransferControl
@@ -48,39 +46,26 @@ def parse_args():
     return p.parse_args()
 
 
-# ── keyboard listener ─────────────────────────────────────────────────────────
+_SPECIAL = {
+    Key.up:    'up',
+    Key.down:  'down',
+    Key.left:  'left',
+    Key.right: 'right',
+    Key.esc:   'esc',
+}
+_CHARS = {'q', 'e', 'h', '=', '+', '-'}
 
-def make_key_queue() -> tuple[queue.Queue, pynput_kb.Listener]:
-    """
-    Returns (q, listener).  Each key press pushes a token string onto q:
-      'up' | 'down' | 'left' | 'right' | 'q' | 'e' | '=' | '-' | 'h' | 'esc'
-    Start listener.start() before using q.
-    """
-    q = queue.Queue()
 
-    _SPECIAL = {
-        pynput_kb.Key.up:    'up',
-        pynput_kb.Key.down:  'down',
-        pynput_kb.Key.left:  'left',
-        pynput_kb.Key.right: 'right',
-        pynput_kb.Key.esc:   'esc',
-    }
-    _CHARS = {'q', 'e', 'h', '=', '+', '-'}
-
-    def on_press(key):
-        token = _SPECIAL.get(key)
-        if token is None:
-            try:
-                c = key.char.lower() if key.char else None
-                if c in _CHARS:
-                    token = '=' if c == '+' else c
-            except AttributeError:
-                pass
-        if token:
-            q.put(token)
-
-    listener = pynput_kb.Listener(on_press=on_press)
-    return q, listener
+def parse_key(key) -> str | None:
+    token = _SPECIAL.get(key)
+    if token is None:
+        try:
+            c = key.char.lower() if key.char else None
+            if c in _CHARS:
+                token = '=' if c == '+' else c
+        except AttributeError:
+            pass
+    return token
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -133,42 +118,40 @@ def main():
                 cumulative[ax] = 0.0
         print('Homing complete.')
 
-    # ── start keyboard listener ────────────────────────────────────────────────
-    key_q, listener = make_key_queue()
-    listener.start()
-
     print('Ready.  Arrows=XY  Q/E=Z  =/−=scale  H=home  ESC=quit')
     print_status(scale, step, cumulative)
 
     try:
-        while True:
-            try:
-                key = key_q.get(timeout=0.05)
-            except queue.Empty:
-                continue
+        with Events() as events:
+            for event in events:
+                if not isinstance(event, Events.Press):
+                    continue
 
-            if   key == 'up':    move('y',  step)
-            elif key == 'down':  move('y', -step)
-            elif key == 'left':  move('x', -step)
-            elif key == 'right': move('x',  step)
-            elif key == 'q':     move('z',  step)
-            elif key == 'e':     move('z', -step)
-            elif key == '=':
-                scale = min(SCALE_MAX, round(scale + SCALE_STEP, 10))
-                print_status(scale, step, cumulative)
-            elif key == '-':
-                scale = max(SCALE_MIN, round(scale - SCALE_STEP, 10))
-                print_status(scale, step, cumulative)
-            elif key == 'h':
-                home()
-                print_status(scale, step, cumulative)
-            elif key == 'esc':
-                break
+                key = parse_key(event.key)
+                if key is None:
+                    continue
+
+                if   key == 'up':    move('y',  step)
+                elif key == 'down':  move('y', -step)
+                elif key == 'left':  move('x', -step)
+                elif key == 'right': move('x',  step)
+                elif key == 'q':     move('z',  step)
+                elif key == 'e':     move('z', -step)
+                elif key == '=':
+                    scale = min(SCALE_MAX, round(scale + SCALE_STEP, 10))
+                    print_status(scale, step, cumulative)
+                elif key == '-':
+                    scale = max(SCALE_MIN, round(scale - SCALE_STEP, 10))
+                    print_status(scale, step, cumulative)
+                elif key == 'h':
+                    home()
+                    print_status(scale, step, cumulative)
+                elif key == 'esc':
+                    break
 
     except KeyboardInterrupt:
         pass
     finally:
-        listener.stop()
         home()
         liveview_proc.terminate()
         liveview_proc.wait()
