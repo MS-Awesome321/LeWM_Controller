@@ -1,20 +1,19 @@
 """
 Manual keyboard control for the nanochemistry transfer stage.
 
-The camera liveview runs as a completely separate subprocess (liveview.py) so it
-never pauses or freezes regardless of what the main process is doing.
-Keyboard input is handled via pynput (no cv2 window needed in main).
+Hold a key to jog continuously; release to stop.
+The camera liveview runs as a completely separate subprocess (liveview.py).
 
 Keys:
-    Arrow Up    — move Y forward
-    Arrow Down  — move Y backward
-    Arrow Left  — move X left
-    Arrow Right — move X right
-    Q           — move Z up
-    E           — move Z down
-    =  /  +     — increase ACTION_SCALE by 0.1
-    -           — decrease ACTION_SCALE by 0.1 (min 0.1)
-    H           — home (return to start position)
+    Arrow Up    — jog Y forward
+    Arrow Down  — jog Y backward
+    Arrow Left  — jog X left
+    Arrow Right — jog X right
+    Q           — jog Z up
+    E           — jog Z down
+    =  /  +     — increase ACTION_SCALE by 0.1  (tap)
+    -           — decrease ACTION_SCALE by 0.1  (tap)
+    H           — home  (tap)
     ESC / Ctrl-C — home and exit
 """
 from __future__ import annotations
@@ -22,29 +21,22 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
-from pynput.keyboard import Events, Key
+from pynput.keyboard import Key, Listener
 
 sys.path.insert(0, str(Path(__file__).parent))
 from hardware.transfer_control_controller import TransferControl
 
 # ── constants ─────────────────────────────────────────────────────────────────
-STEP_MM      = 1.0
+STEP_MM      = 1.0    # mm sent per jog tick
+JOG_HZ       = 10     # jog ticks per second while key held
 ACTION_SCALE = 0.1
 SCALE_STEP   = 0.1
 SCALE_MIN    = 0.1
 SCALE_MAX    = 10.0
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description='Manual transfer stage controller.')
-    p.add_argument('--fps',      type=int,   default=15)
-    p.add_argument('--index',    type=int,   default=0)
-    p.add_argument('--step',     type=float, default=STEP_MM, help='Base step size (mm)')
-    p.add_argument('--no_robot', action='store_true', help='No robot — keyboard + liveview only')
-    return p.parse_args()
-
 
 _SPECIAL = {
     Key.up:    'up',
@@ -53,22 +45,31 @@ _SPECIAL = {
     Key.right: 'right',
     Key.esc:   'esc',
 }
-_CHARS = {'q', 'e', 'h', '=', '+', '-'}
+_JOG_KEYS  = {'up', 'down', 'left', 'right', 'q', 'e'}
+_TAP_KEYS  = {'=', '-', 'h', 'esc'}
 
 
-def parse_key(key) -> str | None:
+def parse_args():
+    p = argparse.ArgumentParser(description='Manual transfer stage controller.')
+    p.add_argument('--fps',      type=int,   default=15)
+    p.add_argument('--index',    type=int,   default=0)
+    p.add_argument('--step',     type=float, default=STEP_MM, help='Base step size per tick (mm)')
+    p.add_argument('--hz',       type=float, default=JOG_HZ,  help='Jog ticks per second')
+    p.add_argument('--no_robot', action='store_true')
+    return p.parse_args()
+
+
+def key_to_token(key) -> str | None:
     token = _SPECIAL.get(key)
     if token is None:
         try:
             c = key.char.lower() if key.char else None
-            if c in _CHARS:
+            if c in ('q', 'e', 'h', '=', '+', '-'):
                 token = '=' if c == '+' else c
         except AttributeError:
             pass
     return token
 
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 def print_status(scale: float, step: float, cumulative: dict):
     eff = step * scale
@@ -79,22 +80,22 @@ def print_status(scale: float, step: float, cumulative: dict):
     )
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
-
 def main():
     args  = parse_args()
     scale = ACTION_SCALE
     step  = args.step
+    hz    = args.hz
     cumulative = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+    stop_flag  = threading.Event()
 
-    # ── launch liveview subprocess ─────────────────────────────────────────────
+    # ── liveview subprocess ────────────────────────────────────────────────────
     liveview_script = Path(__file__).parent / 'liveview.py'
     liveview_proc   = subprocess.Popen(
         [sys.executable, str(liveview_script),
          '--index', str(args.index), '--fps', str(args.fps)],
     )
 
-    # ── connect robot ──────────────────────────────────────────────────────────
+    # ── robot ──────────────────────────────────────────────────────────────────
     robot = None
     if not args.no_robot:
         robot = TransferControl()
@@ -111,47 +112,73 @@ def main():
         if robot is None:
             return
         print('\nHoming...')
-        for ax, total in cumulative.items():
+        for ax, total in list(cumulative.items()):
             if total != 0.0:
                 print(f'  return {ax} by {-total:+.3f} mm')
                 robot.move_axis_by(ax, -total)
                 cumulative[ax] = 0.0
         print('Homing complete.')
 
-    print('Ready.  Arrows=XY  Q/E=Z  =/−=scale  H=home  ESC=quit')
+    # ── held-key tracking ─────────────────────────────────────────────────────
+    held = set()   # tokens currently held down
+    held_lock = threading.Lock()
+
+    def on_press(key):
+        nonlocal scale
+        token = key_to_token(key)
+        if token is None:
+            return
+
+        if token in _JOG_KEYS:
+            with held_lock:
+                held.add(token)
+        elif token == '=':
+            scale = min(SCALE_MAX, round(scale + SCALE_STEP, 10))
+            print_status(scale, step, cumulative)
+        elif token == '-':
+            scale = max(SCALE_MIN, round(scale - SCALE_STEP, 10))
+            print_status(scale, step, cumulative)
+        elif token == 'h':
+            home()
+            print_status(scale, step, cumulative)
+        elif token == 'esc':
+            stop_flag.set()
+            return False   # stop listener
+
+    def on_release(key):
+        token = key_to_token(key)
+        if token in _JOG_KEYS:
+            with held_lock:
+                held.discard(token)
+
+    listener = Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+
+    print('Ready.  Hold Arrows/QE to jog.  =/- scale.  H=home.  ESC=quit.')
     print_status(scale, step, cumulative)
 
+    interval = 1.0 / hz
     try:
-        with Events() as events:
-            for event in events:
-                if not isinstance(event, Events.Press):
-                    continue
+        while not stop_flag.is_set():
+            with held_lock:
+                active = set(held)
 
-                key = parse_key(event.key)
-                if key is None:
-                    continue
-
-                if   key == 'up':    move('y',  step)
-                elif key == 'down':  move('y', -step)
-                elif key == 'left':  move('x', -step)
-                elif key == 'right': move('x',  step)
-                elif key == 'q':     move('z',  step)
-                elif key == 'e':     move('z', -step)
-                elif key == '=':
-                    scale = min(SCALE_MAX, round(scale + SCALE_STEP, 10))
-                    print_status(scale, step, cumulative)
-                elif key == '-':
-                    scale = max(SCALE_MIN, round(scale - SCALE_STEP, 10))
-                    print_status(scale, step, cumulative)
-                elif key == 'h':
-                    home()
-                    print_status(scale, step, cumulative)
-                elif key == 'esc':
-                    break
+            if active:
+                for token in active:
+                    if   token == 'up':    move('y',  step)
+                    elif token == 'down':  move('y', -step)
+                    elif token == 'left':  move('x', -step)
+                    elif token == 'right': move('x',  step)
+                    elif token == 'q':     move('z',  step)
+                    elif token == 'e':     move('z', -step)
+                time.sleep(interval)
+            else:
+                time.sleep(0.01)   # idle — stay responsive without burning CPU
 
     except KeyboardInterrupt:
         pass
     finally:
+        listener.stop()
         home()
         liveview_proc.terminate()
         liveview_proc.wait()
