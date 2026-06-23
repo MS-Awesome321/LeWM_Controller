@@ -112,9 +112,9 @@ class KST201:
         self._wait_stop(timeout_s=timeout_ms / 1000)
 
     def start_jog(self, direction: str) -> None:
-        """Start continuous jog without blocking. direction: 'forward' or 'backward'."""
+        """Start jog without blocking. direction: 'forward' or 'backward'."""
         d = MotorDirection.Forward if direction == 'forward' else MotorDirection.Backward
-        self.dev.MoveJog(d)
+        self.dev.MoveJog(d, 0)
 
     def stop(self) -> None:
         """Stop motion immediately."""
