@@ -174,11 +174,14 @@ class KST201Controller(KST201):
         )
 
 
-# if __name__ == "__main__":
-#     X = KST201('26007120')
-#     X.connect()
-#     print(X.position())
-#     X.home()
-#     print(X.position())
-#     print(X.get_speed())
-#     X.disconnect()
+if __name__ == "__main__":
+    X = KST201('26007120')
+    X.connect()
+    print(X.position())
+    X.start_jog('forward')
+    time.sleep(0.5)
+    print(X.position())
+    print(X.get_speed())
+    time.sleep(0.5)
+    X.stop()
+    X.disconnect()

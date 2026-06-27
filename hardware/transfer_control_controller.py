@@ -153,6 +153,7 @@ class TransferControl:
         if axis_key not in {'x', 'y', 'z'}:
             raise ValueError("stop_axis only supported on x/y/z (KST201) axes.")
         self._get_axis(axis).stop()
+        
 
     def jog_axis(self, axis: str, step: float) -> None:
         self._require_ready()
