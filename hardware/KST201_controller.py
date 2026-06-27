@@ -109,7 +109,7 @@ class KST201:
         direction = MotorDirection.Forward if step > 0 else MotorDirection.Backward
         self.dev.SetJogStepSize(dec(abs(step)))
         self.dev.MoveJog(direction, int(timeout_ms))
-        self._wait_stop(timeout_s=timeout_ms / 1000)
+        # self._wait_stop(timeout_s=timeout_ms / 1000)
 
     def start_jog(self, direction: str) -> None:
         """Start jog without blocking. direction: 'forward' or 'backward'."""
@@ -175,13 +175,14 @@ class KST201Controller(KST201):
 
 
 if __name__ == "__main__":
-    X = KST201('26007120')
+    X = KST201('26007081')
     X.connect()
+    print(X.get_speed())
+    X.set_speed(max_vel=10.0, accel=0.5, min_vel=10.0)
     print(X.position())
-    X.start_jog('forward')
-    time.sleep(0.5)
+    X.jog(-1.0)
     print(X.position())
     print(X.get_speed())
-    time.sleep(0.5)
+    time.sleep(2)
     X.stop()
     X.disconnect()
