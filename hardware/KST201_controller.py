@@ -107,7 +107,12 @@ class KST201:
         self._check_pos(target)
 
         direction = MotorDirection.Forward if step > 0 else MotorDirection.Backward
-        self.dev.SetJogStepSize(dec(abs(step)))
+        jog_params = self.dev.GetJogParams()
+        print(vars(jog_params))
+        # jog_params.StepSize = Decimal(100.0)    # Set step size (in device units/steps)
+        # jog_params.MaxVelocity = Decimal(50.0)  # Set max velocity
+        # jog_params.Acceleration = Decimal(10.0) # Set acceleration
+        # self.dev.SetJogParams(jog_params)
         self.dev.MoveJog(direction, int(timeout_ms))
         # self._wait_stop(timeout_s=timeout_ms / 1000)
 
@@ -177,12 +182,11 @@ class KST201Controller(KST201):
 if __name__ == "__main__":
     X = KST201('26007081')
     X.connect()
-    print(X.get_speed())
-    X.set_speed(max_vel=10.0, accel=0.5, min_vel=10.0)
     print(X.position())
-    X.jog(-1.0)
+    X.dev.SetJogStepSize(dec(5))
+    X.dev.MoveJog(MotorDirection.Backward, 0)
     print(X.position())
-    print(X.get_speed())
-    time.sleep(2)
+    time.sleep(10)
+    print(X.position())
     X.stop()
     X.disconnect()
