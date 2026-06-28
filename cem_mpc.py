@@ -243,6 +243,7 @@ def main():
 
         # ── cv2 loop ──────────────────────────────────────────────────────────
         cv2.namedWindow('CEM-MPC', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('CEM-MPC', IMG_SIZE * 5, IMG_SIZE * 5)
 
         cumulative  = {ax: 0.0 for ax in AXES}
         step        = 0
