@@ -1,4 +1,5 @@
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -52,6 +53,10 @@ try:
                 print('Lower')
                 i = -THROTTLE
                 arm.jog_axis('z', '-')
+            elif key == 48:   # 0
+                fname = f"capture_{time.strftime('%Y%m%d_%H%M%S')}.png"
+                cv2.imwrite(fname, frame)
+                print(f'Saved {fname}')
             elif key == 27:   # ESC
                 print("Stopping All: ", key)
                 arm.stop_xyz()
