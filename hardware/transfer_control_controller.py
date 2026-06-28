@@ -43,6 +43,7 @@ class TransferControl:
         L_pos_max_mm: float = 195.0,
         L_max_speed: Optional[int] = None,
         auto_connect: bool = True,
+        only_xyz = False,
     ) -> None:
         self._config = {
             "x_serial": x_serial,
@@ -62,6 +63,7 @@ class TransferControl:
         self.L = None
         self._axes: dict[str, object] = {}
         self._connected = False
+        self.only_xyz = only_xyz
 
         if auto_connect:
             self.connect()
@@ -74,7 +76,9 @@ class TransferControl:
         visible = list(DeviceManagerCLI.GetDeviceList())
         print("Kinesis sees:", sorted(visible))
 
-        for name in ["x", "y", "z", "goni", "L"]:
+        connect_list = ["x", "y", "z", "goni", "L"] if not self.only_xyz else ["x", "y", "z"]
+
+        for name in connect_list:
             axis = self._axes[name]
             print(f"Connecting {name} ({axis.__class__.__name__}) ...")
             axis.connect()
@@ -85,7 +89,9 @@ class TransferControl:
     def disconnect(self) -> None:
         if not self._connected:
             return
-        for name in ["L", "goni", "z", "y", "x"]:
+        
+        connect_list = ["x", "y", "z", "goni", "L"] if not self.only_xyz else ["x", "y", "z"]
+        for name in connect_list:
             try:
                 self._axes[name].disconnect()
             except Exception:

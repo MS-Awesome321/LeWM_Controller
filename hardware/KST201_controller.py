@@ -26,7 +26,7 @@ class KST201:
         polling_ms: int = 200,
         pos_left: float = 0.0,   # optional min limit in real units (mm)
         pos_right: float  = 13.0,  # optional max limit in real units (mm)
-        jog_size: float=5.0
+        jog_size: float=1.0
     ):
         self.serial = serial
         self.polling_ms = polling_ms
@@ -108,7 +108,8 @@ class KST201:
             d = MotorDirection.Backward
         else:
             raise ValueError("direction should be either + or -")
-        self.dev.MoveJog(d, int(timeout_ms))
+        if not self.dev.Status.IsMoving:
+            self.dev.MoveJog(d, 0)
 
     def stop(self) -> None:
         """Stop motion immediately."""
@@ -172,9 +173,13 @@ if __name__ == "__main__":
     X = KST201('26007081')
     X.connect()
     print(X.position())
-    X.dev.MoveJog(MotorDirection.Backward, 0)
+    X.dev.MoveJog(MotorDirection.Forward, 0)
     print(X.position())
-    time.sleep(10)
+    time.sleep(2)
+    print(X.dev.Status.IsMoving)
+    time.sleep(2)
     print(X.position())
     X.stop()
+    time.sleep(1)
+    print(X.dev.Status.IsMoving)
     X.disconnect()
