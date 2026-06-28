@@ -75,6 +75,8 @@ class KST201:
         return float(str(self.dev.Position))
 
     def _wait_stop(self, timeout_s: float):
+        if timeout_s == 0:
+            return
         t0 = time.time()
         while self.dev.Status.IsMoving:
             time.sleep(0.05)
@@ -88,16 +90,16 @@ class KST201:
         if self.pos_right is not None and target > self.pos_right:
             raise ValueError(f"KST201 target {target} out of range (max {self.pos_right})")
 
-    def home(self, timeout_ms: int = 60000):
-        self.dev.Home(int(timeout_ms))
+    def home(self, timeout_ms: int = 0):
+        self.dev.Home(0)
         self._wait_stop(timeout_s=timeout_ms / 1000)
 
-    def move_to(self, pos: float, timeout_ms: int = 60000):
+    def move_to(self, pos: float, timeout_ms: int = 0):
         self._check_pos(pos)
-        self.dev.MoveTo(dec(pos), int(timeout_ms))
+        self.dev.MoveTo(dec(pos), 0)
         self._wait_stop(timeout_s=timeout_ms / 1000)
 
-    def move_by(self, delta: float, timeout_ms: int = 60000):
+    def move_by(self, delta: float, timeout_ms: int = 0) -> None:
         target = self.position() + delta
         self.move_to(target, timeout_ms=timeout_ms)
 

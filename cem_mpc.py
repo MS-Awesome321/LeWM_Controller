@@ -282,8 +282,15 @@ def run_mpc(
         if robot is not None:
             for ax, delta in zip(axes, action):
                 print(f'  move {ax} by {delta:+.3f} mm  (raw {raw_action[list(axes).index(ax)]:+.3f} × {action_scale})')
-                robot.move_axis_by(ax, float(delta))
+                robot.move_axis_by(ax, float(delta), timeout_ms=0)
                 cumulative[ax] += float(delta)
+            # wait for all axes to finish moving
+            t_settle = time.perf_counter()
+            kst_axes = [robot._get_axis(ax) for ax in axes if ax in ('x', 'y', 'z')]
+            while any(a.dev.Status.IsMoving for a in kst_axes):
+                if time.perf_counter() - t_settle > settle_s + 10.0:
+                    break
+                time.sleep(0.02)
             time.sleep(settle_s)
         else:
             for ax, delta in zip(axes, action):
@@ -370,7 +377,7 @@ def main():
     robot = None
     if not args.dry_run and not args.no_motion:
         from hardware.transfer_control_controller import TransferControl
-        robot = TransferControl()
+        robot = TransferControl(only_xyz=True)
         print('Robot connected.')
 
     if args.no_motion:

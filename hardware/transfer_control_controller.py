@@ -135,14 +135,14 @@ class TransferControl:
         else:
             axis_obj.move_to(float(value))
 
-    def move_axis_by(self, axis: str, delta: float) -> None:
+    def move_axis_by(self, axis: str, delta: float, timeout_ms: int = 0) -> None:
         self._require_ready()
         axis_obj = self._get_axis(axis)
         axis_key = axis.lower()
         if axis_key == "goni":
             axis_obj.move_by(float(delta))
         else:
-            axis_obj.move_by(float(delta))
+            axis_obj.move_by(float(delta), timeout_ms=timeout_ms)
 
     def jog_axis(self, axis: str, direction: str) -> None:
         """Start continuous non-blocking jog on a KST201 axis. direction: 'forward'|'backward'."""
