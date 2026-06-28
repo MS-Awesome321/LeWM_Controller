@@ -150,16 +150,28 @@ def cem_plan(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def draw_overlay(frame_bgr: np.ndarray, step: int, dist: float,
-                 action: np.ndarray | None, cost: float | None) -> np.ndarray:
-    out = frame_bgr.copy()
+                 action: np.ndarray | None, cost: float | None,
+                 frame_counter: int) -> np.ndarray:
+    out   = frame_bgr.copy()
+    font  = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 1.3
+    thick = 3
+
+    # bottom-left info lines
     lines = [f'Step: {step}', f'Dist: {dist:.4f}']
     if action is not None:
         lines.append(f'dx={action[0]:+.3f} dy={action[1]:+.3f} dz={action[2]:+.3f} mm')
     if cost is not None:
         lines.append(f'CEM cost: {cost:.4f}')
     for i, txt in enumerate(lines):
-        cv2.putText(out, txt, (10, 24 + i * 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(out, txt, (10, 44 + i * 44), font, scale, (0, 255, 0), thick, cv2.LINE_AA)
+
+    # top-right live frame counter
+    label = f'Frame {frame_counter}'
+    (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
+    x = out.shape[1] - tw - 10
+    cv2.putText(out, label, (x, th + 10), font, scale, (0, 220, 255), thick, cv2.LINE_AA)
+
     return out
 
 
@@ -245,12 +257,13 @@ def main():
         cv2.namedWindow('CEM-MPC', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('CEM-MPC', IMG_SIZE * 5, IMG_SIZE * 5)
 
-        cumulative  = {ax: 0.0 for ax in AXES}
-        step        = 0
-        debounce_i  = 0          # counts down to 0 after each move
-        dist        = float('inf')
-        last_action = None
-        last_cost   = None
+        cumulative    = {ax: 0.0 for ax in AXES}
+        step          = 0
+        frame_counter = 0
+        debounce_i    = 0          # counts down to 0 after each move
+        dist          = float('inf')
+        last_action   = None
+        last_cost     = None
 
         while True:
             # ── grab frame & display (every iteration) ────────────────────────
@@ -261,7 +274,8 @@ def main():
                 frame_rgb = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
                 frame_bgr = frame_rgb.copy()
 
-            display = draw_overlay(frame_bgr, step, dist, last_action, last_cost)
+            frame_counter += 1
+            display = draw_overlay(frame_bgr, step, dist, last_action, last_cost, frame_counter)
             cv2.imshow('CEM-MPC', display)
             if cv2.waitKey(1) == 27:   # ESC
                 print('ESC — stopping.')
