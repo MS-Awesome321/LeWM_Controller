@@ -79,38 +79,9 @@ def build_model(device: str):
 
     return vae, encoder, projector, delta_embedder, ldp
 
-
-def _remap_encoder_keys(sd: dict) -> dict:
-    """Remap checkpoint keys from older transformers naming to current ViTModel naming.
-
-    Older: layers.N.attention.q_proj / k_proj / v_proj / o_proj / mlp.fc1 / mlp.fc2
-    Current: encoder.layer.N.attention.attention.query / key / value /
-             attention.output.dense / intermediate.dense / output.dense
-    """
-    import re
-    subst = [
-        ('attention.q_proj',    'attention.attention.query'),
-        ('attention.k_proj',    'attention.attention.key'),
-        ('attention.v_proj',    'attention.attention.value'),
-        ('attention.o_proj',    'attention.output.dense'),
-        ('mlp.fc1',             'intermediate.dense'),
-        ('mlp.fc2',             'output.dense'),
-    ]
-    new_sd = {}
-    for k, v in sd.items():
-        new_k = re.sub(r'^layers\.(\d+)\.', r'encoder.layer.\1.', k)
-        for old, new in subst:
-            new_k = new_k.replace(old, new)
-        new_sd[new_k] = v
-    return new_sd
-
-
 def load_checkpoint(ckpt_path: Path, encoder, projector, delta_embedder, ldp, device: str):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     enc_sd = ckpt['encoder']
-    # detect old key scheme and remap if necessary
-    # if any(k.startswith('layers.') for k in enc_sd):
-    #     enc_sd = _remap_encoder_keys(enc_sd)
     encoder.load_state_dict(enc_sd)
     projector.load_state_dict(ckpt['projector'])
     delta_embedder.load_state_dict(ckpt['delta_embedder'])
@@ -236,6 +207,7 @@ def run_mpc(
     action_scale:    float = 1.0,
     axes:            tuple = ('x', 'y', 'z'),
     settle_s:        float = 0.5,
+    throttle_s:      float = 0.2,
 ) -> dict:
     """
     MPC loop: capture frame → plan → send overlay to liveview → execute → repeat.
@@ -247,8 +219,18 @@ def run_mpc(
     print(f'Goal embedding norm: {goal_emb.norm().item():.3f}')
 
     cumulative = {ax: 0.0 for ax in axes}
+    last_move_t = 0.0
 
     for step in range(max_steps):
+        # ── throttle: wait for motors to stop and honour minimum inter-step gap ─
+        if robot is not None:
+            kst_axes = [robot._get_axis(ax) for ax in axes if ax in ('x', 'y', 'z')]
+            while any(a.dev.Status.IsMoving for a in kst_axes):
+                time.sleep(0.02)
+            elapsed = time.perf_counter() - last_move_t
+            if elapsed < throttle_s:
+                time.sleep(throttle_s - elapsed)
+
         # ── observe ───────────────────────────────────────────────────────────
         frame = capture_frame(cam) if cam is not None else \
                 np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
@@ -284,13 +266,7 @@ def run_mpc(
                 print(f'  move {ax} by {delta:+.3f} mm  (raw {raw_action[list(axes).index(ax)]:+.3f} × {action_scale})')
                 robot.move_axis_by(ax, float(delta), timeout_ms=0)
                 cumulative[ax] += float(delta)
-            # wait for all axes to finish moving
-            t_settle = time.perf_counter()
-            kst_axes = [robot._get_axis(ax) for ax in axes if ax in ('x', 'y', 'z')]
-            while any(a.dev.Status.IsMoving for a in kst_axes):
-                if time.perf_counter() - t_settle > settle_s + 10.0:
-                    break
-                time.sleep(0.02)
+            last_move_t = time.perf_counter()
             time.sleep(settle_s)
         else:
             for ax, delta in zip(axes, action):
@@ -322,6 +298,7 @@ def parse_args():
     p.add_argument('--steps',    type=int,   default=50,   help='Max MPC steps')
     p.add_argument('--threshold',type=float, default=2.0,  help='Goal embedding dist threshold')
     p.add_argument('--settle',   type=float, default=0.5,  help='Settle time after move (s)')
+    p.add_argument('--throttle', type=float, default=0.2,  help='Min inter-step gap (s)')
     return p.parse_args()
 
 
@@ -404,6 +381,7 @@ def main():
             action_max=args.max_step,
             action_scale=ACTION_SCALE,
             settle_s=args.settle,
+            throttle_s=args.throttle,
         )
     except KeyboardInterrupt:
         print('\nInterrupted — homing robot to start position...')

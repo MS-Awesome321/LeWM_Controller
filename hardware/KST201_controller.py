@@ -91,21 +91,27 @@ class KST201:
             raise ValueError(f"KST201 target {target} out of range (max {self.pos_right})")
 
     def home(self, timeout_ms: int = 0):
+        if self.dev.Status.IsMoving:
+            return
         self.dev.Home(0)
         self._wait_stop(timeout_s=timeout_ms / 1000)
 
     def move_to(self, pos: float, timeout_ms: int = 0):
+        if self.dev.Status.IsMoving:
+            return
         self._check_pos(pos)
         self.dev.MoveTo(dec(pos), 0)
         self._wait_stop(timeout_s=timeout_ms / 1000)
 
     def move_by(self, delta: float, timeout_ms: int = 0) -> None:
+        if self.dev.Status.IsMoving:
+            return
         target = self.position() + delta
         self.move_to(target, timeout_ms=timeout_ms)
 
-    def jog(self, direction='+', timeout_ms: int = 60000):
+    def jog(self, direction='+', timeout_ms: int = 0):
         if direction == '+':
-            d = MotorDirection.Forward  
+            d = MotorDirection.Forward
         elif direction == '-':
             d = MotorDirection.Backward
         else:
