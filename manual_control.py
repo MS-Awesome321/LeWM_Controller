@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 ACTION_SCALE = 0.1
-THROTTLE = 20
+DEBOUNCE = 20
 
 try:
     cam = CameraController(index=0, fps=15)
@@ -31,27 +31,27 @@ try:
         if i >= 0:
             if key == 123 or key == 97: # a
                 print('Left')
-                i = -THROTTLE
+                i = -DEBOUNCE
                 arm.jog_axis('x', '+')
             elif key == 124 or key == 100: # d
                 print('Right')
-                i = -THROTTLE
+                i = -DEBOUNCE
                 arm.jog_axis('x', '-')
             elif key == 125 or key == 115: # s
                 print('Down')
-                i = -THROTTLE
+                i = -DEBOUNCE
                 arm.jog_axis('y', '+')
             elif key == 126 or key == 119: # w
                 print('Up')
-                i = -THROTTLE
+                i = -DEBOUNCE
                 arm.jog_axis('y', '-')
             elif key == 113: # q
                 print('Raise')
-                i = -THROTTLE
+                i = -DEBOUNCE
                 arm.jog_axis('z', '+')
             elif key == 101: # e
                 print('Lower')
-                i = -THROTTLE
+                i = -DEBOUNCE
                 arm.jog_axis('z', '-')
             elif key == 48:   # 0
                 fname = f"capture_{time.strftime('%Y%m%d_%H%M%S')}.png"

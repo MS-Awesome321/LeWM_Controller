@@ -207,7 +207,7 @@ def run_mpc(
     action_scale:    float = 1.0,
     axes:            tuple = ('x', 'y', 'z'),
     settle_s:        float = 0.5,
-    throttle_s:      float = 0.2,
+    debounce_s:      float = 0.2,
 ) -> dict:
     """
     MPC loop: capture frame → plan → send overlay to liveview → execute → repeat.
@@ -222,14 +222,14 @@ def run_mpc(
     last_move_t = 0.0
 
     for step in range(max_steps):
-        # ── throttle: wait for motors to stop and honour minimum inter-step gap ─
+        # ── debounce: wait for motors to stop and honour minimum inter-step gap ─
         if robot is not None:
             kst_axes = [robot._get_axis(ax) for ax in axes if ax in ('x', 'y', 'z')]
             while any(a.dev.Status.IsMoving for a in kst_axes):
                 time.sleep(0.02)
             elapsed = time.perf_counter() - last_move_t
-            if elapsed < throttle_s:
-                time.sleep(throttle_s - elapsed)
+            if elapsed < debounce_s:
+                time.sleep(debounce_s - elapsed)
 
         # ── observe ───────────────────────────────────────────────────────────
         frame = capture_frame(cam) if cam is not None else \
@@ -298,7 +298,7 @@ def parse_args():
     p.add_argument('--steps',    type=int,   default=50,   help='Max MPC steps')
     p.add_argument('--threshold',type=float, default=2.0,  help='Goal embedding dist threshold')
     p.add_argument('--settle',   type=float, default=0.5,  help='Settle time after move (s)')
-    p.add_argument('--throttle', type=float, default=0.2,  help='Min inter-step gap (s)')
+    p.add_argument('--debounce', type=float, default=0.2,  help='Min inter-step gap (s)')
     return p.parse_args()
 
 
@@ -381,7 +381,7 @@ def main():
             action_max=args.max_step,
             action_scale=ACTION_SCALE,
             settle_s=args.settle,
-            throttle_s=args.throttle,
+            debounce_s=args.debounce,
         )
     except KeyboardInterrupt:
         print('\nInterrupted — homing robot to start position...')
