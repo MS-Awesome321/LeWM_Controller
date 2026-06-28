@@ -138,13 +138,13 @@ class TransferControl:
         else:
             axis_obj.move_by(float(delta))
 
-    def start_jog_axis(self, axis: str, direction: str) -> None:
+    def jog_axis(self, axis: str, direction: str) -> None:
         """Start continuous non-blocking jog on a KST201 axis. direction: 'forward'|'backward'."""
         self._require_ready()
         axis_key = axis.lower()
         if axis_key not in {'x', 'y', 'z'}:
             raise ValueError("start_jog_axis only supported on x/y/z (KST201) axes.")
-        self._get_axis(axis).start_jog(direction)
+        self._get_axis(axis).jog(direction)
 
     def stop_axis(self, axis: str) -> None:
         """Stop a KST201 axis immediately."""
@@ -153,16 +153,10 @@ class TransferControl:
         if axis_key not in {'x', 'y', 'z'}:
             raise ValueError("stop_axis only supported on x/y/z (KST201) axes.")
         self._get_axis(axis).stop()
-        
 
-    def jog_axis(self, axis: str, step: float) -> None:
-        self._require_ready()
-        axis_key = axis.lower()
-        if axis_key == "l":
-            self.L.move_by(float(step))
-            return
-        axis_obj = self._get_axis(axis)
-        axis_obj.jog(float(step))
+    def stop_xyz(self) -> None:
+        for axis in ['x', 'y', 'z']:
+            self.stop_axis(axis)
 
     def set_kst_speed(self, axis: str, max_vel: float, accel: float, min_vel: float = 0.0) -> None:
         self._require_ready()

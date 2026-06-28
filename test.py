@@ -25,20 +25,28 @@ try:
 
         if key == 123:
             print('Left')
+            arm.jog_axis('x', '+')
         elif key == 124:
             print('Right')
+            arm.jog_axis('x', '-')
         elif key == 125:
+            arm.jog_axis('y', '-')
             print('Down')
         elif key == 126:
+            arm.jog_axis('y', '+')
             print('Up')
+        elif key == 113: # q
+            arm.jog_axis('z', '+')
+            print('Raise')
+        elif key == 101: # e
+            arm.jog_axis('z', '-')
+            print('Lower')
         elif key == 27:   # ESC
-            print("Stop: ", key)
-
+            print("Stopping All: ", key)
+            arm.stop()
             break
         else:
-            print("Stop Jog: ", key)
-
-
+            arm.stop()
 
 except KeyboardInterrupt:
     pass

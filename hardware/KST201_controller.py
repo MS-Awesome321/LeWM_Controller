@@ -26,6 +26,7 @@ class KST201:
         polling_ms: int = 200,
         pos_left: float = 0.0,   # optional min limit in real units (mm)
         pos_right: float  = 13.0,  # optional max limit in real units (mm)
+        jog_size: float=5.0
     ):
         self.serial = serial
         self.polling_ms = polling_ms
@@ -33,6 +34,7 @@ class KST201:
 
         self.pos_left = pos_left
         self.pos_right = pos_right
+        self.jog_size = jog_size
 
     def connect(self):
         DeviceManagerCLI.BuildDeviceList()
@@ -54,6 +56,7 @@ class KST201:
         time.sleep(0.1)
 
         self.dev = d
+        self.dev.SetJogStepSize(dec(self.jog_size))
 
     def disconnect(self):
         if self.dev is None:
@@ -98,28 +101,14 @@ class KST201:
         target = self.position() + delta
         self.move_to(target, timeout_ms=timeout_ms)
 
-    def jog(self, step: float, timeout_ms: int = 60000):
-        # signed step: + forward, - backward
-        if step == 0:
-            raise ValueError("Jog step must be non-zero.")
-
-        target = self.position() + step
-        self._check_pos(target)
-
-        direction = MotorDirection.Forward if step > 0 else MotorDirection.Backward
-        jog_params = self.dev.GetJogParams()
-        print(vars(jog_params))
-        # jog_params.StepSize = Decimal(100.0)    # Set step size (in device units/steps)
-        # jog_params.MaxVelocity = Decimal(50.0)  # Set max velocity
-        # jog_params.Acceleration = Decimal(10.0) # Set acceleration
-        # self.dev.SetJogParams(jog_params)
-        self.dev.MoveJog(direction, int(timeout_ms))
-        # self._wait_stop(timeout_s=timeout_ms / 1000)
-
-    def start_jog(self, direction: str) -> None:
-        """Start jog without blocking. direction: 'forward' or 'backward'."""
-        d = MotorDirection.Forward if direction == 'forward' else MotorDirection.Backward
-        self.dev.MoveJog(d, 0)
+    def jog(self, direction='+', timeout_ms: int = 60000):
+        if direction == '+':
+            d = MotorDirection.Forward  
+        elif direction == '-':
+            d = MotorDirection.Backward
+        else:
+            raise ValueError("direction should be either + or -")
+        self.dev.MoveJog(d, int(timeout_ms))
 
     def stop(self) -> None:
         """Stop motion immediately."""
@@ -183,7 +172,6 @@ if __name__ == "__main__":
     X = KST201('26007081')
     X.connect()
     print(X.position())
-    X.dev.SetJogStepSize(dec(5))
     X.dev.MoveJog(MotorDirection.Backward, 0)
     print(X.position())
     time.sleep(10)
