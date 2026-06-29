@@ -149,10 +149,44 @@ def cem_plan(
 # Overlay
 # ─────────────────────────────────────────────────────────────────────────────
 
+PX_PER_MM = 8.0
+
+
 def draw_overlay(frame_bgr: np.ndarray, step: int, dist: float,
                  action: np.ndarray | None, cost: float | None,
-                 frame_counter: int) -> np.ndarray:
-    out   = frame_bgr.copy()
+                 frame_counter: int,
+                 best_actions: np.ndarray | None = None,
+                 elite_actions: np.ndarray | None = None) -> np.ndarray:
+    out  = frame_bgr.copy()
+    h, w = out.shape[:2]
+    cx, cy = w // 2, h // 2
+
+    # elite trajectories (grey)
+    if elite_actions is not None:
+        for seq in elite_actions:
+            pts = [(cx, cy)]
+            for dx, dy, _ in seq:
+                pts.append((int(pts[-1][0] + dx * PX_PER_MM),
+                            int(pts[-1][1] - dy * PX_PER_MM)))
+            for a, b in zip(pts[:-1], pts[1:]):
+                cv2.line(out, a, b, (80, 80, 80), 1, cv2.LINE_AA)
+            cv2.circle(out, pts[-1], 2, (80, 80, 80), -1)
+
+    # best trajectory (colour-coded by dz)
+    if best_actions is not None:
+        pts = [(cx, cy)]
+        for dx, dy, _ in best_actions:
+            pts.append((int(pts[-1][0] + dx * PX_PER_MM),
+                        int(pts[-1][1] - dy * PX_PER_MM)))
+        for i, (a, b) in enumerate(zip(pts[:-1], pts[1:])):
+            dz  = float(best_actions[i, 2])
+            r   = max(0, min(255, int(128 + dz * 12)))
+            g   = 220
+            bc  = max(0, min(255, int(128 - dz * 12)))
+            cv2.line(out, a, b, (bc, g, r), 2, cv2.LINE_AA)
+            cv2.circle(out, b, 3, (bc, g, r), -1)
+        cv2.circle(out, pts[0], 5, (0, 255, 255), -1)
+
     font  = cv2.FONT_HERSHEY_SIMPLEX
     scale = 1.3
     thick = 3
@@ -169,8 +203,7 @@ def draw_overlay(frame_bgr: np.ndarray, step: int, dist: float,
     # top-right live frame counter
     label = f'Frame {frame_counter}'
     (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
-    x = out.shape[1] - tw - 10
-    cv2.putText(out, label, (x, th + 10), font, scale, (0, 220, 255), thick, cv2.LINE_AA)
+    cv2.putText(out, label, (w - tw - 10, th + 10), font, scale, (0, 220, 255), thick, cv2.LINE_AA)
 
     return out
 
@@ -257,13 +290,15 @@ def main():
         cv2.namedWindow('CEM-MPC', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('CEM-MPC', IMG_SIZE * 5, IMG_SIZE * 5)
 
-        cumulative    = {ax: 0.0 for ax in AXES}
-        step          = 0
-        frame_counter = 0
-        debounce_i    = 0          # counts down to 0 after each move
-        dist          = float('inf')
-        last_action   = None
-        last_cost     = None
+        cumulative      = {ax: 0.0 for ax in AXES}
+        step            = 0
+        frame_counter   = 0
+        debounce_i      = 0
+        dist            = float('inf')
+        last_action     = None
+        last_cost       = None
+        last_best       = None    # (horizon, 3) np array
+        last_elite      = None    # (n_elite, horizon, 3) np array
 
         while True:
             # ── grab frame & display (every iteration) ────────────────────────
@@ -275,7 +310,8 @@ def main():
                 frame_bgr = frame_rgb.copy()
 
             frame_counter += 1
-            display = draw_overlay(frame_bgr, step, dist, last_action, last_cost, frame_counter)
+            display = draw_overlay(frame_bgr, step, dist, last_action, last_cost, frame_counter,
+                                   best_actions=last_best, elite_actions=last_elite)
             cv2.imshow('CEM-MPC', display)
             if cv2.waitKey(1) == 27:   # ESC
                 print('ESC — stopping.')
@@ -302,7 +338,7 @@ def main():
 
             # ── plan ──────────────────────────────────────────────────────────
             t0 = time.perf_counter()
-            best_actions, best_cost, _ = cem_plan(
+            best_actions, best_cost, elite_actions = cem_plan(
                 current_emb, goal_emb, delta_embedder, ldp,
                 horizon=args.horizon, n_samples=args.samples,
                 n_elite=args.elite, n_iters=args.iters,
@@ -315,6 +351,8 @@ def main():
             raw_action  = best_actions[0].cpu().numpy()
             last_action = raw_action * ACTION_SCALE
             last_cost   = best_cost
+            last_best   = best_actions.cpu().numpy()
+            last_elite  = elite_actions.numpy()
 
             # ── execute ───────────────────────────────────────────────────────
             if robot is not None:
