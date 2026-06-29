@@ -40,7 +40,7 @@ from module import MLP
 IMG_SIZE = 224
 EMB_DIM  = 192
 
-DEBOUNCE = 20   # loop iterations to skip after issuing a move
+DEBOUNCE = 200   # loop iterations to skip after issuing a move
 
 
 class FourierDeltaEmbedder(nn.Module):
@@ -233,7 +233,8 @@ def parse_args():
 
 
 def main():
-    ACTION_SCALE = 0.01
+    ACTION_SCALE = 10
+    ACTION_CAP = 1.0
     AXES = ('x', 'y', 'z')
 
     args = parse_args()
@@ -269,6 +270,7 @@ def main():
     # ── hardware ──────────────────────────────────────────────────────────────
     cam   = None
     robot = None
+    position = []
 
     try:
         if not args.dry_run:
@@ -279,9 +281,13 @@ def main():
         if not args.dry_run and not args.no_motion:
             from hardware.transfer_control_controller import TransferControl
             robot = TransferControl(only_xyz=True)
+            robot.connect()
             for ax in AXES:
-                robot.set_kst_speed(ax, max_vel=10.0, accel=1000.0, min_vel=0.0)
-            print('Robot connected.')
+                robot.set_kst_speed(ax, max_vel=10.0, accel=10000.0, min_vel=0.0)
+            p = robot.positions()
+            print('Robot connected. Positions:', p)
+            position = [float(pos) for _, pos in robot.positions().items()]
+            start_position = position.copy()
 
         if args.no_motion:
             print('No-motion mode — camera live, moves skipped.')
@@ -290,7 +296,6 @@ def main():
         cv2.namedWindow('CEM-MPC', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('CEM-MPC', IMG_SIZE * 5, IMG_SIZE * 5)
 
-        cumulative      = {ax: 0.0 for ax in AXES}
         step            = 0
         frame_counter   = 0
         debounce_i      = 0
@@ -356,28 +361,33 @@ def main():
 
             # ── execute ───────────────────────────────────────────────────────
             if robot is not None:
-                for ax, delta in zip(AXES, last_action):
-                    print(f'  move {ax} by {delta:+.4f} mm')
-                    robot.move_axis_by(ax, float(delta), timeout_ms=0)
-                    cumulative[ax] += float(delta)
-                time.sleep(args.settle)
+                for ax, delta, pos in zip(AXES, last_action, position):
+                    delta = max(0, min(ACTION_CAP, float(delta)))
+                    print(f'  move {ax} to {pos+delta:+.4f} mm')
+                    robot.move_axis_to(ax, pos+delta)
                 debounce_i = args.debounce
             else:
-                for ax, delta in zip(AXES, last_action):
-                    print(f'  move {ax} by {delta:+.4f} mm  (no-op)')
+                for ax, delta, pos in zip(AXES, last_action, position):
+                    delta = max(0, min(ACTION_CAP, float(delta)))
+                    print(f'  move {ax} to {pos+delta:+.4f} mm  (no-op)')
 
             step += 1
 
     except KeyboardInterrupt:
         print('\nInterrupted.')
 
+    except Exception as e:
+        print(f'Error: {e}')
+        raise 
+
     finally:
         if robot is not None:
             print('Homing robot to start position...')
-            for ax, total in cumulative.items():
-                if total != 0.0:
-                    print(f'  return {ax} by {-total:+.3f} mm')
-                    robot.move_axis_by(ax, -total)
+            time.sleep(args.settle)
+            for ax, pos in zip(AXES, start_position):
+                print(f'  return {ax} to {pos:+.3f} mm')
+                robot.move_axis_to(ax, pos)
+                time.sleep(args.settle)
             robot.disconnect()
             print('Done.')
         if cam is not None:

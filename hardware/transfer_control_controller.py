@@ -118,13 +118,20 @@ class TransferControl:
 
     def positions(self) -> dict[str, float]:
         self._require_ready()
-        return {
-            "x": self.x.position(),
-            "y": self.y.position(),
-            "z": self.z.position(),
-            "goni": self.goni.angle(),
-            "L": self.L.position_mm(),
-        }
+        if self.only_xyz:
+            return {
+                "x": self.x.position(),
+                "y": self.y.position(),
+                "z": self.z.position(),
+            }
+        else:
+            return {
+                "x": self.x.position(),
+                "y": self.y.position(),
+                "z": self.z.position(),
+                "goni": self.goni.angle(),
+                "L": self.L.position_mm(),
+            }
 
     def move_axis_to(self, axis: str, value: float) -> None:
         self._require_ready()
@@ -229,3 +236,17 @@ class TransferController(TransferControl):
     """Compatibility alias for workflow code expecting TransferController."""
 
     pass
+
+if __name__ == "__main__":
+    try:
+        robot = TransferControl(only_xyz=True)
+        robot.connect()
+        print("Positions:", robot.positions())
+        robot.move_axis_to("x", 2.5)
+        robot.move_axis_to("y", 1.0)
+        robot.move_axis_to("z", 0.2)
+        print("Positions after move command:", robot.positions())
+        time.sleep(1)
+        print("Positions after 1s:", robot.positions())
+    finally:
+        robot.disconnect()

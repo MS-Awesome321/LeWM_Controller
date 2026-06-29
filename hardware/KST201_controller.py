@@ -83,13 +83,6 @@ class KST201:
             if time.time() - t0 > timeout_s:
                 raise TimeoutError("KST201 move timeout")
 
-    def _check_pos(self, target: float):
-        # keep simple: only check if limits are provided
-        if self.pos_left is not None and target < self.pos_left:
-            raise ValueError(f"KST201 target {target} out of range (min {self.pos_left})")
-        if self.pos_right is not None and target > self.pos_right:
-            raise ValueError(f"KST201 target {target} out of range (max {self.pos_right})")
-
     def home(self, timeout_ms: int = 0):
         if self.dev.Status.IsMoving:
             return
@@ -99,15 +92,14 @@ class KST201:
     def move_to(self, pos: float, timeout_ms: int = 0):
         if self.dev.Status.IsMoving:
             return
-        self._check_pos(pos)
         self.dev.MoveTo(dec(pos), 0)
         self._wait_stop(timeout_s=timeout_ms / 1000)
 
     def move_by(self, delta: float, timeout_ms: int = 0) -> None:
         if self.dev.Status.IsMoving:
             return
-        target = self.position() + delta
-        self.move_to(target, timeout_ms=timeout_ms)
+        self.dev.MoveRelative(1, dec(delta))
+        self._wait_stop(timeout_s=timeout_ms / 1000)
 
     def jog(self, direction='+', timeout_ms: int = 0):
         if direction == '+':
@@ -181,7 +173,8 @@ if __name__ == "__main__":
     X = KST201('26007081')
     X.connect()
     print(X.position())
-    X.dev.MoveJog(MotorDirection.Forward, 0)
+    # X.dev.MoveJog(MotorDirection.Forward, 0)
+    X.move_by(-.1)
     print(X.position())
     time.sleep(2)
     print(X.dev.Status.IsMoving)
