@@ -98,8 +98,6 @@ def _remap_encoder_keys(sd: dict) -> dict:
 def load_checkpoint(ckpt_path: Path, encoder, head, device: str):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     enc_sd = ckpt['encoder']
-    if any(k.startswith('layers.') for k in enc_sd):
-        enc_sd = _remap_encoder_keys(enc_sd)
     encoder.load_state_dict(enc_sd)
     head.load_state_dict(ckpt['head'])
     delta_mean = ckpt['delta_mean'].to(device)
@@ -173,8 +171,8 @@ def draw_overlay(frame_bgr: np.ndarray, step: int, dist: float,
 def parse_args():
     p = argparse.ArgumentParser(description='Displacement-predictor MPC transfer stage controller.')
     p.add_argument('--goal',      required=True,       help='Path to goal frame image')
-    p.add_argument('--ckpt',      default=None,        help='Path to displacement checkpoint (.pt). '
-                                                            'Defaults to latest disp_epoch_*.pt in checkpoints/')
+    p.add_argument('--ckpt',      default='checkpoints/disp_epoch_0080.pt', help='Path to displacement checkpoint (.pt). '
+                                                                            'Defaults to latest disp_epoch_*.pt in checkpoints/')
     p.add_argument('--dry_run',   action='store_true', help='Predict with dummy frame, no robot/camera')
     p.add_argument('--no_motion', action='store_true', help='Use live camera but skip robot moves')
     p.add_argument('--scale',     type=float, default=0.3,  help='Fraction of predicted Δ to execute per step')
