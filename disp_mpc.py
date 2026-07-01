@@ -133,6 +133,10 @@ def predict_displacement(cur_emb: torch.Tensor, goal_emb: torch.Tensor, head,
 # Overlay
 # ─────────────────────────────────────────────────────────────────────────────
 
+ARROW_MIN_PX = 40    # arrow always at least this long when direction is nonzero
+ARROW_MAX_PX = 150   # cap so it never blows past the frame
+
+
 def draw_overlay(frame_bgr: np.ndarray, step: int, dist: float,
                  pred_xyz: np.ndarray | None, move_xyz: np.ndarray | None,
                  frame_counter: int) -> np.ndarray:
@@ -140,11 +144,17 @@ def draw_overlay(frame_bgr: np.ndarray, step: int, dist: float,
     h, w = out.shape[:2]
     cx, cy = w // 2, h // 2
 
-    # intended x/y move vector as an arrow from frame center
+    # intended x/y move vector as an arrow from frame center.
+    # Direction is exact; length is visually rescaled (independent of the
+    # tiny physical mm magnitude) so it's always readable on screen.
     if move_xyz is not None:
         dx, dy = float(move_xyz[0]), float(move_xyz[1])
-        end = (int(cx + dx * PX_PER_MM), int(cy - dy * PX_PER_MM))
-        cv2.arrowedLine(out, (cx, cy), end, (0, 140, 255), 3, tipLength=0.25)
+        mag = (dx ** 2 + dy ** 2) ** 0.5
+        if mag > 1e-6:
+            ux, uy   = dx / mag, dy / mag
+            arrow_px = min(ARROW_MAX_PX, max(ARROW_MIN_PX, mag * PX_PER_MM))
+            end = (int(cx + ux * arrow_px), int(cy - uy * arrow_px))
+            cv2.arrowedLine(out, (cx, cy), end, (0, 140, 255), 4, tipLength=0.3)
     cv2.circle(out, (cx, cy), 5, (0, 255, 255), -1)
 
     font  = cv2.FONT_HERSHEY_SIMPLEX
