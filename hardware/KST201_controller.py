@@ -75,6 +75,9 @@ class KST201:
 
     def position(self) -> float:
         return float(str(self.dev.Position))
+    
+    def is_moving(self) -> bool:
+        return self.dev.Status.IsMoving
 
     def _wait_stop(self, timeout_s: float):
         if timeout_s == 0:

@@ -31,9 +31,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 IMG_SIZE = 224
 EMB_DIM  = 192
-PX_PER_MM = 40000
+PX_PER_MM = 1e5
 
-DEBOUNCE = 100   # loop iterations to skip after issuing a move
+DEBOUNCE = 20   # loop iterations to skip after issuing a move
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,7 +150,7 @@ def draw_overlay(frame_bgr: np.ndarray, step: int, dist: float,
         mag = (dx ** 2 + dy ** 2) ** 0.5
         if mag > 1e-6:
             arrow_px = min(ARROW_MAX_PX, max(ARROW_MIN_PX, mag * PX_PER_MM))
-            end = (int(cx + dx * arrow_px), int(cy - dy * arrow_px))
+            end = (int(cx + dx * arrow_px), int(cy + dy * arrow_px))
             cv2.arrowedLine(out, (cx, cy), end, (0, 140, 255), 4, tipLength=0.3)
     cv2.circle(out, (cx, cy), 5, (0, 255, 255), -1)
 
@@ -185,8 +185,8 @@ def parse_args():
     p.add_argument('--dry_run',   action='store_true', help='Predict with dummy frame, no robot/camera')
     p.add_argument('--no_motion', action='store_true', help='Use live camera but skip robot moves')
     p.add_argument('--scale',     type=float, default=1,  help='Fraction of predicted Δ to execute per step')
-    p.add_argument('--max_step',  type=float, default=1.0,  help='Max |Δ| per axis per step (mm)')
-    p.add_argument('--threshold', type=float, default=0.1,  help='Goal distance threshold (mm)')
+    p.add_argument('--max_step',  type=float, default=0.1,  help='Max |Δ| per axis per step (mm)')
+    p.add_argument('--threshold', type=float, default=0.1,help='Goal distance threshold (mm)')
     p.add_argument('--settle',    type=float, default=0.5,  help='Settle time after move (s)')
     p.add_argument('--debounce',  type=int,   default=DEBOUNCE,
                                               help='Loop iterations to skip after a move')
@@ -292,11 +292,12 @@ def main():
             cur_emb   = encode_frame(frame_rgb, encoder, device)
             pred_xyz  = predict_displacement(cur_emb, goal_emb, head, delta_mean, delta_std)
             dist      = float(np.linalg.norm(pred_xyz))
+            pred_xyz[0] *= -1
             last_pred = pred_xyz
             # print(f'\nStep {step+1}  |  dist: {dist:.4f} mm  |  pred: {pred_xyz}')
 
             if dist < args.threshold:
-                print('Goal reached.')
+                print(f'Goal reached. {dist} mm away.')
                 goal_reached = True
                 break
 
@@ -306,7 +307,7 @@ def main():
 
             # ── execute ───────────────────────────────────────────────────────
             if robot is not None:
-                for i, ax in enumerate(AXES[:-1]):
+                for i, ax in enumerate(AXES):
                     position[i] += float(move_xyz[i])
                     print(f'  move {ax} to {position[i]:+.4f} mm')
                     robot.move_axis_to(ax, position[i])
@@ -327,11 +328,22 @@ def main():
     finally:
         if start_position and not goal_reached:
             print('Homing robot to start position...')
-            time.sleep(args.settle)
+            robot.stop_xyz()
             for ax, pos in zip(AXES, start_position):
                 print(f'  return {ax} to {pos:+.3f} mm')
                 robot.move_axis_to(ax, pos)
-                time.sleep(args.settle)
+            
+            time.sleep(args.settle)
+            if cam is not None:
+                frame_bgr = cam.snap()
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            else:
+                frame_rgb = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
+                frame_bgr = frame_rgb.copy()
+
+            cv2.imshow('Disp-MPC', frame_bgr)
+            cv2.waitKey(1000)
+
         if robot is not None:
             robot.disconnect()
             print('Done.')
