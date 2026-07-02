@@ -18,8 +18,10 @@ try:
     cv2.namedWindow('Manual Transfer Control', cv2.WINDOW_NORMAL)
 
     arm = TransferControl(only_xyz=True)
-    for axis in ['x', 'y', 'z']:
-        arm.set_kst_speed(axis, max_vel=10.0, accel=1000.0, min_vel=0.0)
+    # for axis in ['x', 'y', 'z']:
+    #     print(arm.get_kst_speed(axis))
+    #     arm.set_kst_speed(axis, max_vel=10.0, accel=10000.0, min_vel=10.0)
+    #     print(arm.get_kst_speed(axis))
 
     i = 0
     while True:

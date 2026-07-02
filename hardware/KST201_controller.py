@@ -63,10 +63,12 @@ class KST201:
             return
         try:
             self.dev.StopPolling()
+            time.sleep(0.1)
         except Exception:
             pass
         try:
             self.dev.Disconnect(True)
+            time.sleep(0.1)
         except Exception:
             pass
         self.dev = None
@@ -92,14 +94,10 @@ class KST201:
     def move_to(self, pos: float, timeout_ms: int = 0):
         if self.dev.Status.IsMoving:
             return
-        self.dev.MoveTo(dec(pos), 0)
-        self._wait_stop(timeout_s=timeout_ms / 1000)
+        self.dev.MoveTo(dec(pos), timeout_ms)
 
     def move_by(self, delta: float, timeout_ms: int = 0) -> None:
-        if self.dev.Status.IsMoving:
-            return
-        self.dev.MoveRelative(1, dec(delta))
-        self._wait_stop(timeout_s=timeout_ms / 1000)
+        return self.move_to(self.position() + delta, timeout_ms=timeout_ms)
 
     def jog(self, direction='+', timeout_ms: int = 0):
         if direction == '+':
@@ -109,7 +107,7 @@ class KST201:
         else:
             raise ValueError("direction should be either + or -")
         if not self.dev.Status.IsMoving:
-            self.dev.MoveJog(d, 0)
+            self.dev.MoveJog(d, timeout_ms)
 
     def stop(self) -> None:
         """Stop motion immediately."""
