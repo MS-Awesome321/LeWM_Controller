@@ -1,36 +1,24 @@
 """
 Validate an affine-transform calibration by warping frame_1 to match frame_2.
-
-No motors are driven here. You supply frame_1, frame_2, and the known/assumed
-(dx, dy) displacement (mm) between them (e.g. moved the stage by hand, or read
-it off the encoder yourself). The script warps frame_1 by dx,dy * px_per_mm and
-shows [frame_1 | warped frame_1 | frame_2] side by side so you can visually
-confirm the transform lines up.
-
 Usage:
     python validate_encoder.py --img1 a.png --img2 b.png --dx 1.0 --dy 0.0
     python validate_encoder.py --img1 a.png --img2 b.png --dx 1.0 --dy 0.0 --px_per_mm 8.0
-    python validate_encoder.py --dx 1.0 --dy 0.0   # capture frame_1/frame_2 live from camera only
 """
 from __future__ import annotations
 
 import argparse
-import sys
-from pathlib import Path
 
 import cv2
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
-
 
 def parse_args():
-    p = argparse.ArgumentParser(description='Validate transfer stage position encoder against camera.')
-    p.add_argument('--dx', type=float, default=1.0, help='Test move Δx (mm)')
-    p.add_argument('--dy', type=float, default=0.0, help='Test move Δy (mm)')
+    p = argparse.ArgumentParser(description='Validate an affine-transform displacement against two images.')
+    p.add_argument('--img1', required=True, help='Path to frame_1')
+    p.add_argument('--img2', required=True, help='Path to frame_2')
+    p.add_argument('--dx', type=float, required=True, help='Displacement Δx (mm)')
+    p.add_argument('--dy', type=float, required=True, help='Displacement Δy (mm)')
     p.add_argument('--px_per_mm', type=float, default=8.0, help='Calibration: pixels per mm')
-    p.add_argument('--img1', default=None, help='Path to frame_1 (omit to capture live from camera)')
-    p.add_argument('--img2', default=None, help='Path to frame_2 (omit to capture live from camera)')
     return p.parse_args()
 
 
