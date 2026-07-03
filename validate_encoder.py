@@ -1,26 +1,21 @@
 """
-Validate the transfer stage's position encoder against what the camera actually sees.
+Validate an affine-transform calibration by warping frame_1 to match frame_2.
 
-Procedure:
-    1. Capture frame_1 and read encoder position_1.
-    2. Move the stage by (dx, dy) mm (non-blocking, debounced on IsMoving).
-    3. Capture frame_2 and read encoder position_2.
-    4. delta_mm = position_2 - position_1  (the encoder's account of what moved)
-    5. Warp frame_1 by delta_mm * px_per_mm (x/y only) using cv2.warpAffine.
-    6. Show [frame_1 | warped frame_1 | frame_2] side by side.
-
-If the encoder + calibration (--px_per_mm) are correct, the warped frame_1
-should visually line up with frame_2.
+No motors are driven here. You supply frame_1, frame_2, and the known/assumed
+(dx, dy) displacement (mm) between them (e.g. moved the stage by hand, or read
+it off the encoder yourself). The script warps frame_1 by dx,dy * px_per_mm and
+shows [frame_1 | warped frame_1 | frame_2] side by side so you can visually
+confirm the transform lines up.
 
 Usage:
-    python validate_encoder.py --dx 1.0 --dy 0.0
-    python validate_encoder.py --img1 a.png --img2 b.png --dx 1.0 --dy 0.0 --dry_run
+    python validate_encoder.py --img1 a.png --img2 b.png --dx 1.0 --dy 0.0
+    python validate_encoder.py --img1 a.png --img2 b.png --dx 1.0 --dy 0.0 --px_per_mm 8.0
+    python validate_encoder.py --dx 1.0 --dy 0.0   # capture frame_1/frame_2 live from camera only
 """
 from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path
 
 import cv2
@@ -34,11 +29,8 @@ def parse_args():
     p.add_argument('--dx', type=float, default=1.0, help='Test move Δx (mm)')
     p.add_argument('--dy', type=float, default=0.0, help='Test move Δy (mm)')
     p.add_argument('--px_per_mm', type=float, default=8.0, help='Calibration: pixels per mm')
-    p.add_argument('--settle', type=float, default=0.5, help='Settle time after move (s)')
-    p.add_argument('--dry_run', action='store_true',
-                   help='Use --img1/--img2 files instead of live camera/robot')
-    p.add_argument('--img1', default=None, help='(dry_run) path to frame_1')
-    p.add_argument('--img2', default=None, help='(dry_run) path to frame_2')
+    p.add_argument('--img1', default=None, help='Path to frame_1 (omit to capture live from camera)')
+    p.add_argument('--img2', default=None, help='Path to frame_2 (omit to capture live from camera)')
     return p.parse_args()
 
 
@@ -52,51 +44,27 @@ def label(img: np.ndarray, text: str) -> np.ndarray:
 def main():
     args = parse_args()
 
-    if args.dry_run:
-        if not args.img1 or not args.img2:
-            raise ValueError('--dry_run requires --img1 and --img2')
+    if args.img1 and args.img2:
         frame1 = cv2.imread(args.img1)
         frame2 = cv2.imread(args.img2)
         if frame1 is None or frame2 is None:
             raise FileNotFoundError('Could not read --img1/--img2')
-        delta_mm = np.array([args.dx, args.dy], dtype=np.float32)
 
     else:
         from hardware.camera_controller import CameraController
-        from hardware.transfer_control_controller import TransferControl
 
-        cam   = CameraController(index=0, fps=15)
-        robot = TransferControl(only_xyz=True)
-
+        cam = CameraController(index=0, fps=15)
         try:
             cam.start()
-            robot.connect()
-
+            input('Position 1 ready. Press Enter to capture frame_1...')
             frame1 = cam.snap()
-            pos1   = robot.positions()
-            print(f'Position 1: {pos1}')
-
-            print(f'Moving x by {args.dx:+.3f} mm, y by {args.dy:+.3f} mm ...')
-            robot.move_axis_by('x', args.dx, timeout_ms=0)
-            robot.move_axis_by('y', args.dy, timeout_ms=0)
-
-            x_axis = robot._get_axis('x')
-            y_axis = robot._get_axis('y')
-            while x_axis.dev.Status.IsMoving or y_axis.dev.Status.IsMoving:
-                time.sleep(0.02)
-            time.sleep(args.settle)
-
+            input('Now move the stage by hand (or however you like), then press Enter to capture frame_2...')
             frame2 = cam.snap()
-            pos2   = robot.positions()
-            print(f'Position 2: {pos2}')
-
-            delta_mm = np.array([pos2['x'] - pos1['x'], pos2['y'] - pos1['y']], dtype=np.float32)
-
         finally:
             cam.stop()
-            robot.disconnect()
 
-    print(f'Encoder-reported Δ(x, y): {delta_mm} mm')
+    delta_mm = np.array([args.dx, args.dy], dtype=np.float32)
+    print(f'Assumed Δ(x, y): {delta_mm} mm')
 
     delta_px = delta_mm * args.px_per_mm   # (dx_px, dy_px)
     M = np.array([[1, 0, delta_px[0]],
