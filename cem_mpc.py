@@ -40,7 +40,7 @@ from module import MLP
 IMG_SIZE = 224
 EMB_DIM  = 192
 
-DEBOUNCE = 200   # loop iterations to skip after issuing a move
+DEBOUNCE = 20   # loop iterations to skip after issuing a move
 
 
 class FourierDeltaEmbedder(nn.Module):
@@ -233,7 +233,7 @@ def parse_args():
 
 
 def main():
-    ACTION_SCALE = 10
+    ACTION_SCALE = 0.05
     ACTION_CAP = 1.0
     AXES = ('x', 'y', 'z')
 
@@ -282,8 +282,8 @@ def main():
             from hardware.transfer_control_controller import TransferControl
             robot = TransferControl(only_xyz=True)
             robot.connect()
-            for ax in AXES:
-                robot.set_kst_speed(ax, max_vel=10.0, accel=10000.0, min_vel=0.0)
+            # for ax in AXES:
+            #     robot.set_kst_speed(ax, max_vel=10.0, accel=10000.0, min_vel=0.0)
             p = robot.positions()
             print('Robot connected. Positions:', p)
             position = [float(pos) for _, pos in robot.positions().items()]

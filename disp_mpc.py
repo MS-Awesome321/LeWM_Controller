@@ -150,7 +150,7 @@ def draw_overlay(frame_bgr: np.ndarray, step: int, dist: float,
         mag = (dx ** 2 + dy ** 2) ** 0.5
         if mag > 1e-6:
             arrow_px = min(ARROW_MAX_PX, max(ARROW_MIN_PX, mag * PX_PER_MM))
-            end = (int(cx + dx * arrow_px), int(cy + dy * arrow_px))
+            end = (int(cx + dx * arrow_px), int(cy - dy * arrow_px))
             cv2.arrowedLine(out, (cx, cy), end, (0, 140, 255), 4, tipLength=0.3)
     cv2.circle(out, (cx, cy), 5, (0, 255, 255), -1)
 
@@ -186,7 +186,7 @@ def parse_args():
     p.add_argument('--no_motion', action='store_true', help='Use live camera but skip robot moves')
     p.add_argument('--scale',     type=float, default=1,  help='Fraction of predicted Δ to execute per step')
     p.add_argument('--max_step',  type=float, default=0.1,  help='Max |Δ| per axis per step (mm)')
-    p.add_argument('--threshold', type=float, default=0.1,help='Goal distance threshold (mm)')
+    p.add_argument('--threshold', type=float, default=0.1,  help='Goal distance threshold (mm)')
     p.add_argument('--settle',    type=float, default=0.5,  help='Settle time after move (s)')
     p.add_argument('--debounce',  type=int,   default=DEBOUNCE,
                                               help='Loop iterations to skip after a move')
@@ -292,7 +292,7 @@ def main():
             cur_emb   = encode_frame(frame_rgb, encoder, device)
             pred_xyz  = predict_displacement(cur_emb, goal_emb, head, delta_mean, delta_std)
             dist      = float(np.linalg.norm(pred_xyz))
-            pred_xyz[0] *= -1
+            # pred_xyz[0] *= -1
             last_pred = pred_xyz
             # print(f'\nStep {step+1}  |  dist: {dist:.4f} mm  |  pred: {pred_xyz}')
 

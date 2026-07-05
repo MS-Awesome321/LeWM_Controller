@@ -85,8 +85,8 @@ def predict_displacement(cur_emb: torch.Tensor, goal_emb: torch.Tensor, head,
 
 def label(img: np.ndarray, text: str) -> np.ndarray:
     out = img.copy()
-    cv2.putText(out, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                0.9, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(out, text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX,
+                2, (0, 255, 0), 5, cv2.LINE_AA)
     return out
 
 
@@ -95,7 +95,7 @@ def parse_args():
     p.add_argument('--img1', required=True, help='Path to frame_1')
     p.add_argument('--img2', required=True, help='Path to frame_2')
     p.add_argument('--ckpt', default='checkpoints/disp_epoch_0080.pt', help='Path to displacement checkpoint (.pt)')
-    p.add_argument('--px_per_mm', type=float, default=8.0, help='Calibration: pixels per mm')
+    p.add_argument('--px_per_mm', type=float, default=1100.0, help='Calibration: pixels per mm')
     return p.parse_args()
 
 
@@ -130,14 +130,18 @@ def main():
     h, w = frame1.shape[:2]
     warped = cv2.warpAffine(frame1, M, (w, h))
 
-    panel = np.hstack([
-        label(frame1, 'frame_1'),
-        label(warped, f'warped ({delta_mm[0]:+.3f}, {delta_mm[1]:+.3f}) mm'),
-        label(frame2, 'frame_2'),
-    ])
+    cv2.namedWindow('Frame 1', cv2.WINDOW_NORMAL)
+    cv2.namedWindow('Frame 1 Displaced', cv2.WINDOW_NORMAL)
+    cv2.namedWindow('Frame 2', cv2.WINDOW_NORMAL)
 
-    cv2.namedWindow('Displacement validation', cv2.WINDOW_NORMAL)
-    cv2.imshow('Displacement validation', panel)
+    cv2.resizeWindow('Frame 1', 800, 600)
+    cv2.resizeWindow('Frame 1 Displaced', 800, 600)
+    cv2.resizeWindow('Frame 2', 800, 600)
+
+    cv2.imshow('Frame 1', label(frame1, 'frame_1'))
+    cv2.imshow('Frame 1 Displaced', label(warped, f'warped ({delta_mm[0]:+.3f}, {delta_mm[1]:+.3f}) mm'))
+    cv2.imshow('Frame 2', label(frame2, 'frame_2'))
+
     print('Press ESC or any key to close.')
     cv2.waitKey(0)
     cv2.destroyAllWindows()

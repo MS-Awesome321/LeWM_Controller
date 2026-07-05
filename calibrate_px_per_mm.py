@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 def parse_args():
     p = argparse.ArgumentParser(description='Calibrate px_per_mm using SIFT feature matching.')
-    p.add_argument('--dx', type=float, default=0.1, help='Test move Δx (mm)')
+    p.add_argument('--dx', type=float, default=-0.1, help='Test move Δx (mm)')
     p.add_argument('--settle', type=float, default=0.5, help='Settle time after move (s)')
     p.add_argument('--ratio', type=float, default=0.75, help="Lowe's ratio test threshold")
     return p.parse_args()
@@ -76,16 +76,15 @@ def main():
         print(f'Position 1: {pos1}')
 
         print(f'Moving x by {args.dx:+.3f} mm ...')
-        robot.move_axis_by('x', args.dx, timeout_ms=0)
-
-        x_axis = robot._get_axis('x')
-        while x_axis.dev.Status.IsMoving:
-            time.sleep(0.02)
-        time.sleep(args.settle)
+        robot.move_axis_by('x', args.dx, timeout_ms=10000)
 
         frame2 = cam.snap()
         pos2   = robot.positions()
         print(f'Position 2: {pos2}')
+
+        cv2.imshow('frame1', frame1)
+        cv2.imshow('frame2', frame2)
+        cv2.waitKey(0)
 
         dx_mm = pos2['x'] - pos1['x']
         print(f'Encoder-reported Δx: {dx_mm:+.4f} mm')
