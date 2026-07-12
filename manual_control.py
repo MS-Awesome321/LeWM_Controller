@@ -1,5 +1,4 @@
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -7,7 +6,6 @@ from hardware.camera_controller import CameraController
 from hardware.transfer_control_controller import TransferControl
 
 import cv2
-import numpy as np
 
 ACTION_SCALE = 0.1
 DEBOUNCE = 20
@@ -56,9 +54,12 @@ try:
                 i = -DEBOUNCE
                 arm.jog_axis('z', '-')
             elif key == 48:   # 0
-                fname = f"capture_{time.strftime('%Y%m%d_%H%M%S')}.png"
+                pos = arm.positions()
+                fname = f"capture_{pos['x']}_{pos['y']}_{pos['z']}.png"
                 cv2.imwrite(fname, frame)
                 print(f'Saved {fname}')
+            elif key == 112:  # p
+                print(arm.positions())
             elif key == 27:   # ESC
                 print("Stopping All: ", key)
                 arm.stop_xyz()
