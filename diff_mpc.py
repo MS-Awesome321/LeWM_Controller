@@ -167,8 +167,8 @@ def parse_args():
     p.add_argument('--no_motion', action='store_true', help='Use live camera but skip robot moves')
     p.add_argument('--scale',     type=float, default=1,  help='Fraction of predicted Δ to execute per step')
     p.add_argument('--max_step',  type=float, default=0.1,  help='Max |Δ| per axis per step (mm)')
-    p.add_argument('--threshold', type=float, default=0.1,  help='Goal xy distance threshold (mm)')
-    p.add_argument('--area_threshold', type=float, default=200.0,
+    p.add_argument('--threshold', type=float, default=0.05,  help='Goal xy distance threshold (mm)')
+    p.add_argument('--area_threshold', type=float, default=100.0,
                                               help='Goal Newton-ring |Δarea| threshold (px²), checked after xy converges')
     p.add_argument('--z_step',    type=float, default=0.01, help='Fixed z nudge per step while aligning ring area (mm)')
     p.add_argument('--debounce',  type=int,   default=DEBOUNCE,
@@ -241,7 +241,6 @@ def main():
         phase         = 'xy'   # 'xy' -> 'z'
 
         while True:
-            # ── grab frame & display (every iteration, at native resolution) ──
             if cam is not None:
                 frame_bgr = cam.snap()
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
