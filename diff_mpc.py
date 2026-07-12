@@ -5,12 +5,16 @@ using the diff-pred ViT trained in diff_pred.ipynb.
 Unlike disp_mpc.py's old Siamese-ViT (which encoded current/goal frames
 separately and concatenated their embeddings), this model runs a single ViT
 over the *blurred difference image* blur(goal) - blur(current) and regresses
-[Δx, Δy, Δcx, Δcy, Δarea] from its CLS token in one forward pass. Only Δx, Δy
-(mm) are used to move the stage — Δcx/Δcy/Δarea (Newton-ring centroid/area,
-px units) are printed/overlaid for diagnostics but there is no reliable Δz
-signal in this model, so the z axis is never moved.
+[Δx, Δy, Δcx, Δcy, Δarea] from its CLS token in one forward pass. There is no
+reliable *magnitude* Δz signal in this model, so z is not driven proportionally
+like x/y. Instead, control runs in two phases:
+  1. 'xy' — move by the predicted Δ(x, y) (mm) each step until within --threshold.
+  2. 'z'  — once xy has converged, nudge z by a fixed --z_step each step: if the
+            predicted target ring area is greater than the current ring area
+            (Δarea > 0) move z down, otherwise move z up, until |Δarea| is within
+            --area_threshold (px²).
 
-Each MPC step: observe → predict Δ(x, y) → move a scaled fraction of it → re-observe.
+Each MPC step: observe → predict → move (xy or z, depending on phase) → re-observe.
 
 Usage:
     python diff_mpc.py --goal goal.png --ckpt checkpoints/diff_pred_epoch_0040.pt
@@ -37,7 +41,6 @@ IMG_SIZE    = 224
 PATCH_SIZE  = 16
 EMB_DIM     = 192
 BLUR_SIGMA  = 2.0    # must match diff_pred.ipynb training
-PX_PER_MM   = 1e5
 
 DEBOUNCE = 20   # loop iterations to skip after issuing a move
 
@@ -136,43 +139,16 @@ def predict_displacement(cur_rgb: np.ndarray, goal_rgb: np.ndarray, vit, head,
 # Overlay
 # ─────────────────────────────────────────────────────────────────────────────
 
-ARROW_MIN_PX = 40    # arrow always at least this long when direction is nonzero
-ARROW_MAX_PX = 1000   # cap so it never blows past the frame
-
-
-def draw_overlay(frame_bgr: np.ndarray, step: int, dist: float,
-                 pred_full: np.ndarray | None, move_xy: np.ndarray | None,
-                 frame_counter: int) -> np.ndarray:
-    out  = frame_bgr.copy()
-    h, w = out.shape[:2]
-    cx, cy = w // 2, h // 2
-
-    # intended x/y move vector as an arrow from frame center.
-    # Direction is exact; length is visually rescaled (independent of the
-    # tiny physical mm magnitude) so it's always readable on screen.
-    if move_xy is not None:
-        dx, dy = float(move_xy[0]), float(move_xy[1])
-        mag = (dx ** 2 + dy ** 2) ** 0.5
-        if mag > 1e-6:
-            arrow_px = min(ARROW_MAX_PX, max(ARROW_MIN_PX, mag * PX_PER_MM))
-            end = (int(cx + dx * arrow_px), int(cy - dy * arrow_px))
-            cv2.arrowedLine(out, (cx, cy), end, (0, 140, 255), 4, tipLength=0.3)
-    cv2.circle(out, (cx, cy), 5, (0, 255, 255), -1)
+def draw_overlay(frame_bgr: np.ndarray, step: int) -> np.ndarray:
+    """Live camera feed (at its native, pre-resize resolution) with just the step count top-right."""
+    out = frame_bgr.copy()
+    w   = out.shape[1]
 
     font  = cv2.FONT_HERSHEY_SIMPLEX
     scale = 1.3
     thick = 3
 
-    lines = [f'Step: {step}', f'Dist: {dist:.4f} mm']
-    if pred_full is not None:
-        lines.append(f'pred dx={pred_full[0]:+.3f} dy={pred_full[1]:+.3f} mm')
-        lines.append(f'pred dcx={pred_full[2]:+.2f} dcy={pred_full[3]:+.2f} darea={pred_full[4]:+.1f} px')
-    if move_xy is not None:
-        lines.append(f'move dx={move_xy[0]:+.3f} dy={move_xy[1]:+.3f} mm')
-    for i, txt in enumerate(lines):
-        cv2.putText(out, txt, (10, 44 + i * 44), font, scale, (0, 255, 0), thick, cv2.LINE_AA)
-
-    label = f'Frame {frame_counter}'
+    label = f'Step: {step}'
     (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
     cv2.putText(out, label, (w - tw - 10, th + 10), font, scale, (0, 220, 255), thick, cv2.LINE_AA)
 
@@ -192,7 +168,10 @@ def parse_args():
     p.add_argument('--no_motion', action='store_true', help='Use live camera but skip robot moves')
     p.add_argument('--scale',     type=float, default=1,  help='Fraction of predicted Δ to execute per step')
     p.add_argument('--max_step',  type=float, default=0.1,  help='Max |Δ| per axis per step (mm)')
-    p.add_argument('--threshold', type=float, default=0.1,  help='Goal distance threshold (mm)')
+    p.add_argument('--threshold', type=float, default=0.1,  help='Goal xy distance threshold (mm)')
+    p.add_argument('--area_threshold', type=float, default=50.0,
+                                              help='Goal Newton-ring |Δarea| threshold (px²), checked after xy converges')
+    p.add_argument('--z_step',    type=float, default=0.01, help='Fixed z nudge per step while aligning ring area (mm)')
     p.add_argument('--settle',    type=float, default=0.5,  help='Settle time after move (s)')
     p.add_argument('--debounce',  type=int,   default=DEBOUNCE,
                                               help='Loop iterations to skip after a move')
@@ -200,7 +179,7 @@ def parse_args():
 
 
 def main():
-    AXES = ('x', 'y', 'z')   # z is never moved — the diff-pred model has no Δz signal
+    AXES = ('x', 'y', 'z')
 
     args = parse_args()
 
@@ -261,15 +240,13 @@ def main():
         cv2.namedWindow('Diff-MPC', cv2.WINDOW_NORMAL)
 
         step          = 0
-        frame_counter = 0
         debounce_i    = 0
         dist          = float('inf')
-        last_pred     = None   # (5,) full predicted [Δx, Δy, Δcx, Δcy, Δarea]
-        last_move     = None   # (2,) scaled/clamped (Δx, Δy) move actually issued (mm)
+        phase         = 'xy'   # 'xy' -> 'z'
         goal_reached = False
 
         while True:
-            # ── grab frame & display (every iteration) ────────────────────────
+            # ── grab frame & display (every iteration, at native resolution) ──
             if cam is not None:
                 frame_bgr = cam.snap()
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -277,8 +254,7 @@ def main():
                 frame_rgb = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
                 frame_bgr = frame_rgb.copy()
 
-            frame_counter += 1
-            display = draw_overlay(frame_bgr, step, dist, last_pred, last_move, frame_counter)
+            display = draw_overlay(frame_bgr, step)
             cv2.imshow('Diff-MPC', display)
             if cv2.waitKey(1) == 27:   # ESC
                 print('ESC — stopping.')
@@ -298,29 +274,45 @@ def main():
             pred_full = predict_displacement(frame_rgb, goal_rgb, vit, head, blur_kernel,
                                              delta_mean, delta_std, device)
             pred_xy   = pred_full[:2]
+            pred_area = float(pred_full[4])
             dist      = float(np.linalg.norm(pred_xy))
-            last_pred = pred_full
-            # print(f'\nStep {step+1}  |  dist: {dist:.4f} mm  |  pred xy: {pred_xy}')
+            # print(f'\nStep {step+1}  |  dist: {dist:.4f} mm  |  pred xy: {pred_xy}  |  darea: {pred_area:.2f}')
 
-            if dist < args.threshold:
-                print(f'Goal reached. {dist} mm away.')
-                goal_reached = True
-                break
+            if phase == 'xy':
+                if dist < args.threshold:
+                    print(f'xy converged ({dist:.4f} mm away) — switching to z alignment.')
+                    phase = 'z'
+                    continue
 
-            # ── scale & clamp move (x, y only — no Δz signal in this model) ───
-            move_xy   = np.clip(pred_xy * args.scale, -args.max_step, args.max_step)
-            last_move = move_xy
+                # ── scale & clamp move (x, y only — no Δz magnitude signal) ───
+                move_xy = np.clip(pred_xy * args.scale, -args.max_step, args.max_step)
 
-            # ── execute ───────────────────────────────────────────────────────
-            if robot is not None:
-                for i, ax in enumerate(('x', 'y')):
-                    position[i] += float(move_xy[i])
-                    print(f'  move {ax} to {position[i]:+.4f} mm')
-                    robot.move_axis_to(ax, position[i])
-                debounce_i = args.debounce
-            else:
-                for ax, delta in zip(('x', 'y'), move_xy):
-                    print(f'  move {ax} by {delta:+.4f} mm  (no-op)')
+                if robot is not None:
+                    for i, ax in enumerate(('x', 'y')):
+                        position[i] += float(move_xy[i])
+                        print(f'  move {ax} to {position[i]:+.4f} mm')
+                        robot.move_axis_to(ax, position[i])
+                    debounce_i = args.debounce
+                else:
+                    for ax, delta in zip(('x', 'y'), move_xy):
+                        print(f'  move {ax} by {delta:+.4f} mm  (no-op)')
+
+            else:   # phase == 'z'
+                if abs(pred_area) < args.area_threshold:
+                    print(f'Goal reached. xy={dist:.4f} mm away, |Δarea|={abs(pred_area):.2f} px² away.')
+                    goal_reached = True
+                    break
+
+                # target ring area greater than current -> move down; otherwise up.
+                move_z = -args.z_step if pred_area > 0 else args.z_step
+
+                if robot is not None:
+                    position[2] += move_z
+                    print(f'  move z to {position[2]:+.4f} mm  (Δarea={pred_area:+.2f} px²)')
+                    robot.move_axis_to('z', position[2])
+                    debounce_i = args.debounce
+                else:
+                    print(f'  move z by {move_z:+.4f} mm  (Δarea={pred_area:+.2f} px²)  (no-op)')
 
             step += 1
 
