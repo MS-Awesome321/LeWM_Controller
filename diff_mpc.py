@@ -36,10 +36,11 @@ from torch import nn
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-IMG_SIZE    = 224
+IMG_SIZE    = 224   # ViT input resolution — unrelated to the camera's native display resolution
 PATCH_SIZE  = 16
 EMB_DIM     = 192
 BLUR_SIGMA  = 2.0    # must match diff_pred.ipynb training
+DRY_RUN_FRAME_SIZE = (1920, 1080)   # placeholder frame size when --dry_run has no camera attached
 
 DEBOUNCE = 20   # loop iterations to skip after issuing a move
 
@@ -245,7 +246,7 @@ def main():
                 frame_bgr = cam.snap()
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             else:
-                frame_rgb = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
+                frame_rgb = np.zeros((DRY_RUN_FRAME_SIZE[1], DRY_RUN_FRAME_SIZE[0], 3), dtype=np.uint8)
                 frame_bgr = frame_rgb.copy()
 
             display = draw_overlay(frame_bgr, step)
