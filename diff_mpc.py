@@ -40,7 +40,7 @@ IMG_SIZE    = 224   # ViT input resolution — unrelated to the camera's native 
 PATCH_SIZE  = 16
 EMB_DIM     = 192
 BLUR_SIGMA  = 2.0    # must match diff_pred.ipynb training
-DRY_RUN_FRAME_SIZE = (1920, 1080)   # placeholder frame size when --dry_run has no camera attached
+DRY_RUN_FRAME_SIZE = (960, 540)   # placeholder frame size when --dry_run has no camera attached
 
 DEBOUNCE = 20   # loop iterations to skip after issuing a move
 
@@ -235,6 +235,7 @@ def main():
 
         # ── cv2 loop ──────────────────────────────────────────────────────────
         cv2.namedWindow('Diff-MPC', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Diff-MPC', DRY_RUN_FRAME_SIZE[0], DRY_RUN_FRAME_SIZE[1])
 
         step          = 0
         debounce_i    = 0
@@ -247,6 +248,7 @@ def main():
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             else:
                 frame_rgb = np.zeros((DRY_RUN_FRAME_SIZE[1], DRY_RUN_FRAME_SIZE[0], 3), dtype=np.uint8)
+                print(frame_rgb.shape)
                 frame_bgr = frame_rgb.copy()
 
             display = draw_overlay(frame_bgr, step)

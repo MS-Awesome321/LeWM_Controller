@@ -14,6 +14,7 @@ try:
     cam = CameraController(index=0, fps=15)
     cam.start()
     cv2.namedWindow('Manual Transfer Control', cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('Manual Transfer Control', 960, 540)
 
     arm = TransferControl(only_xyz=True)
     # for axis in ['x', 'y', 'z']:
