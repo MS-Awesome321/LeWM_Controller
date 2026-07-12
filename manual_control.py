@@ -40,11 +40,11 @@ try:
             elif key == 125 or key == 115: # s
                 print('Down')
                 i = -DEBOUNCE
-                arm.jog_axis('y', '+')
+                arm.jog_axis('y', '-')
             elif key == 126 or key == 119: # w
                 print('Up')
                 i = -DEBOUNCE
-                arm.jog_axis('y', '-')
+                arm.jog_axis('y', '+')
             elif key == 113: # q
                 print('Raise')
                 i = -DEBOUNCE
