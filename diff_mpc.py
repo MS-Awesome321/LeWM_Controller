@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path
 
 import cv2
@@ -169,10 +168,9 @@ def parse_args():
     p.add_argument('--scale',     type=float, default=1,  help='Fraction of predicted Δ to execute per step')
     p.add_argument('--max_step',  type=float, default=0.1,  help='Max |Δ| per axis per step (mm)')
     p.add_argument('--threshold', type=float, default=0.1,  help='Goal xy distance threshold (mm)')
-    p.add_argument('--area_threshold', type=float, default=50.0,
+    p.add_argument('--area_threshold', type=float, default=200.0,
                                               help='Goal Newton-ring |Δarea| threshold (px²), checked after xy converges')
     p.add_argument('--z_step',    type=float, default=0.01, help='Fixed z nudge per step while aligning ring area (mm)')
-    p.add_argument('--settle',    type=float, default=0.5,  help='Settle time after move (s)')
     p.add_argument('--debounce',  type=int,   default=DEBOUNCE,
                                               help='Loop iterations to skip after a move')
     return p.parse_args()
@@ -214,7 +212,6 @@ def main():
     cam   = None
     robot = None
     position = []
-    start_position = []
 
     try:
         if not args.dry_run:
@@ -231,7 +228,6 @@ def main():
             p = robot.positions()
             print('Robot connected. Positions:', p)
             position = [float(pos) for _, pos in robot.positions().items()]
-            start_position = position.copy()
 
         if args.no_motion:
             print('No-motion mode — camera live, moves skipped.')
@@ -243,7 +239,6 @@ def main():
         debounce_i    = 0
         dist          = float('inf')
         phase         = 'xy'   # 'xy' -> 'z'
-        goal_reached = False
 
         while True:
             # ── grab frame & display (every iteration, at native resolution) ──
@@ -276,7 +271,6 @@ def main():
             pred_xy   = pred_full[:2]
             pred_area = float(pred_full[4])
             dist      = float(np.linalg.norm(pred_xy))
-            # print(f'\nStep {step+1}  |  dist: {dist:.4f} mm  |  pred xy: {pred_xy}  |  darea: {pred_area:.2f}')
 
             if phase == 'xy':
                 if dist < args.threshold:
@@ -290,17 +284,15 @@ def main():
                 if robot is not None:
                     for i, ax in enumerate(('x', 'y')):
                         position[i] += float(move_xy[i])
-                        print(f'  move {ax} to {position[i]:+.4f} mm')
                         robot.move_axis_to(ax, position[i])
+                    print(f'  move x to {position[0]:+.4f} mm, y to {position[1]:+.4f} mm')
                     debounce_i = args.debounce
                 else:
-                    for ax, delta in zip(('x', 'y'), move_xy):
-                        print(f'  move {ax} by {delta:+.4f} mm  (no-op)')
+                    print(f'  move x by {move_xy[0]:+.4f} mm, y by {move_xy[1]:+.4f} mm  (no-op)')
 
             else:   # phase == 'z'
                 if abs(pred_area) < args.area_threshold:
                     print(f'Goal reached. xy={dist:.4f} mm away, |Δarea|={abs(pred_area):.2f} px² away.')
-                    goal_reached = True
                     break
 
                 # target ring area greater than current -> move down; otherwise up.
@@ -324,24 +316,6 @@ def main():
         raise
 
     finally:
-        if start_position and not goal_reached:
-            print('Homing robot to start position...')
-            robot.stop_xyz()
-            for ax, pos in zip(AXES, start_position):
-                print(f'  return {ax} to {pos:+.3f} mm')
-                robot.move_axis_to(ax, pos)
-
-            time.sleep(args.settle)
-            if cam is not None:
-                frame_bgr = cam.snap()
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            else:
-                frame_rgb = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
-                frame_bgr = frame_rgb.copy()
-
-            cv2.imshow('Diff-MPC', frame_bgr)
-            cv2.waitKey(1000)
-
         if robot is not None:
             robot.disconnect()
             print('Done.')
