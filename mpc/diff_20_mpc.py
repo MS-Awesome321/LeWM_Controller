@@ -7,10 +7,9 @@ real-pair mix instead of only real episodes).
 
 Unlike diff_mpc.py, the goal frame isn't a pre-rendered image file: at startup this script opens an
 interactive 'Goal Composer' window where you position --top over --bottom (WASD/arrows) and set its
-opacity (trackbar), SIFT-registered onto --video exactly the way diff_pred_20x.ipynb's make_sample
-builds its synthetic frame_j (top/bottom warped through the same fitted affine, composited, then
-downsampled to the model's 224x224 input) — so the baked composite you confirm (ENTER/'c') is in the
-same distribution the model was trained on, and becomes the fixed target for the MPC loop below.
+opacity (trackbar) — top.jpg/bottom.jpg share the same resolution and pixel grid, so this is a plain
+translate + blend, no video or SIFT registration involved. ENTER/'c' bakes the current offset+opacity
+into a fixed 224x224 RGB frame, which becomes the fixed target for the MPC loop below.
 
 Control runs in the same two phases as diff_mpc.py (there's no reliable *magnitude* Δz signal in this
 model):
@@ -145,8 +144,8 @@ def predict_displacement(cur_rgb: np.ndarray, goal_rgb: np.ndarray, vit, head,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Goal composer — interactive top/bottom positioning + opacity, SIFT-registered onto --video
-# (mirrors diff_pred_20x.ipynb's make_sample synthetic-frame construction exactly)
+# Goal composer — interactive top/bottom positioning + opacity (top.jpg/bottom.jpg are already the
+# same resolution and pixel-aligned, so this is a plain translate + blend)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def label(img: np.ndarray, lines: list[str]) -> np.ndarray:
@@ -155,27 +154,6 @@ def label(img: np.ndarray, lines: list[str]) -> np.ndarray:
         cv2.putText(out, text, (5, 20 + idx * 20), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (0, 255, 0), 1, cv2.LINE_AA)
     return out
-
-
-def sift_affine(small_gray: np.ndarray, large_gray: np.ndarray, ratio_thresh: float) -> np.ndarray:
-    """SIFT + ratio-test + RANSAC-affine pipeline (same as flake_designer.py / sift_align.py)."""
-    sift = cv2.SIFT_create()
-    kp1, des1 = sift.detectAndCompute(small_gray, None)
-    kp2, des2 = sift.detectAndCompute(large_gray, None)
-
-    matcher = cv2.BFMatcher(cv2.NORM_L2)
-    knn_matches = matcher.knnMatch(des1, des2, k=2)
-    good = [m for m, n in knn_matches if m.distance < ratio_thresh * n.distance]
-    if len(good) < 3:
-        raise RuntimeError(f'Only {len(good)} good matches — need at least 3 to fit a transform.')
-
-    src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-
-    M, inlier_mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
-    if M is None:
-        raise RuntimeError('Affine transform estimation failed.')
-    return M
 
 
 def pick_folder() -> Path:
@@ -189,11 +167,10 @@ def pick_folder() -> Path:
     return folders[int(choice)]
 
 
-def compose_goal(top_path: Path, bottom_path: Path, video_path: Path,
-                 sift_frame: int, ratio_thresh: float, step: int) -> np.ndarray:
+def compose_goal(top_path: Path, bottom_path: Path, step: int) -> np.ndarray:
     """Interactive 'Goal Composer' window: position --top over --bottom (WASD/arrows) and set its
-    opacity (trackbar), SIFT-registered onto video_path's sift_frame — ENTER/'c' bakes the current
-    offset+opacity into a fixed IMG_SIZE x IMG_SIZE RGB goal frame; ESC cancels the whole program.
+    opacity (trackbar) — ENTER/'c' bakes the current offset+opacity into a fixed IMG_SIZE x IMG_SIZE
+    RGB goal frame; ESC cancels the whole program.
     """
     top_full    = cv2.imread(str(top_path))
     bottom_full = cv2.imread(str(bottom_path))
@@ -202,49 +179,31 @@ def compose_goal(top_path: Path, bottom_path: Path, video_path: Path,
     if bottom_full is None:
         raise FileNotFoundError(f'Could not read image: {bottom_path}')
 
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise FileNotFoundError(f'Could not open video: {video_path}')
-    vw, vh = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, sift_frame)
-    ok, ref_frame = cap.read()
-    cap.release()
-    if not ok:
-        raise RuntimeError(f'Could not read frame {sift_frame} from {video_path}')
+    h, w = bottom_full.shape[:2]
+    preview_w = min(w, 1280)
+    preview_h = int(round(h * preview_w / w))
 
-    bottom_blurred = cv2.GaussianBlur(bottom_full, (15, 15), 0)   # SIFT features only — matches flake_designer.py
-    M = sift_affine(cv2.cvtColor(bottom_blurred, cv2.COLOR_BGR2GRAY),
-                     cv2.cvtColor(ref_frame, cv2.COLOR_BGR2GRAY), ratio_thresh)
-    A, t = M[:, :2], M[:, 2]
-    warped_bottom = cv2.warpAffine(bottom_full, M, (vw, vh))   # fixed — same for every offset
-
-    preview_w = min(vw, 1280)
-    preview_h = int(round(vh * preview_w / vw))
-
-    off_x, off_y = 0.0, 0.0   # (dx, dy) relative to bottom's SIFT-registered position, bottom.jpg's
-                              # native pixel space — same convention as make_sample's offset
+    off_x, off_y = 0.0, 0.0   # (dx, dy) in top.jpg/bottom.jpg's shared native pixel space
 
     win = 'Goal Composer'
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, preview_w, preview_h)
     cv2.createTrackbar('opacity', win, int(round(TOP_OPACITY * 100)), 100, lambda _pos: None)
 
-    print(f"Positioning {top_path.name} over {bottom_path.name} (SIFT-registered onto "
-          f"{video_path.name} frame {sift_frame}).")
+    print(f'Positioning {top_path.name} over {bottom_path.name}.')
     print("WASD/arrows nudge top, 'opacity' trackbar blends it, ENTER/'c' confirms as the MPC goal, ESC cancels.")
 
     while True:
         opacity = cv2.getTrackbarPos('opacity', win) / 100.0
 
-        t_top = t + A @ np.array([off_x, off_y], dtype=np.float32)
-        M_top = np.hstack([A, t_top.reshape(2, 1)]).astype(np.float32)
-        warped_top = cv2.warpAffine(top_full, M_top, (vw, vh))
-        composite = cv2.addWeighted(warped_top, opacity, warped_bottom, 1.0 - opacity, 0.0)
+        M_top = np.array([[1.0, 0.0, off_x], [0.0, 1.0, off_y]], dtype=np.float32)
+        warped_top = cv2.warpAffine(top_full, M_top, (w, h))
+        composite = cv2.addWeighted(warped_top, opacity, bottom_full, 1.0 - opacity, 0.0)
 
         display = cv2.resize(composite, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
         display = label(display, [
             f'{top_path.name} over {bottom_path.name}',
-            f'offset: ({off_x:+.0f}, {off_y:+.0f}) px (bottom.jpg native space)',
+            f'offset: ({off_x:+.0f}, {off_y:+.0f}) px',
             f'opacity: {opacity:.2f}',
             "WASD/arrows nudge, ENTER/'c' confirm, ESC cancel",
         ])
@@ -300,13 +259,10 @@ def draw_overlay(frame_bgr: np.ndarray, step: int) -> np.ndarray:
 
 def parse_args():
     p = argparse.ArgumentParser(description='diff_pred_20x MPC controller with an interactive top/bottom goal composer.')
-    p.add_argument('--folder', default=None, help='20X_DropDown/<n> folder providing top.jpg/bottom.jpg/20x.mp4 (prompts if omitted and --top/--bottom/--video are not all given)')
+    p.add_argument('--folder', default=None, help='20X_DropDown/<n> folder providing top.jpg/bottom.jpg (prompts if omitted and --top/--bottom are not both given)')
     p.add_argument('--top',    default=None, help='Top image path (default: <folder>/top.jpg)')
     p.add_argument('--bottom', default=None, help='Bottom image path (default: <folder>/bottom.jpg)')
-    p.add_argument('--video',  default=None, help='Video used to SIFT-register --bottom (default: <folder>/20x.mp4)')
-    p.add_argument('--sift-frame', type=int, default=0, dest='sift_frame', help='Video frame index used as the SIFT reference frame')
-    p.add_argument('--ratio',  type=float, default=0.75, help="Lowe's ratio test threshold for SIFT match filtering")
-    p.add_argument('--step',   type=int, default=10, help='Native pixels (bottom.jpg space) nudged per key press when positioning --top')
+    p.add_argument('--step',   type=int, default=10, help='Pixels nudged per key press when positioning --top over --bottom')
     p.add_argument('--ckpt',   default=str(REPO_ROOT / 'checkpoints' / 'diff_pred_20x_epoch_0099.pt'),
                                               help='Path to a diff_pred_20x checkpoint (.pt). Defaults to the latest '
                                                    'diff_pred_20x_epoch_*.pt in checkpoints/, falling back to '
@@ -329,14 +285,12 @@ def main():
 
     args = parse_args()
 
-    if args.top is None or args.bottom is None or args.video is None:
+    if args.top is None or args.bottom is None:
         folder = Path(args.folder) if args.folder else pick_folder()
         if args.top is None:
             args.top = str(folder / 'top.jpg')
         if args.bottom is None:
             args.bottom = str(folder / 'bottom.jpg')
-        if args.video is None:
-            args.video = str(folder / '20x.mp4')
 
     if torch.cuda.is_available():
         device = 'cuda'
@@ -352,9 +306,8 @@ def main():
     delta_mean, delta_std = load_checkpoint(ckpt_path, vit, head, device)
     blur_kernel = make_gaussian_kernel(BLUR_SIGMA, device)
 
-    # ── goal frame — interactive positioning + opacity, SIFT-registered onto --video ───────────
-    goal_rgb = compose_goal(Path(args.top), Path(args.bottom), Path(args.video),
-                            args.sift_frame, args.ratio, args.step)
+    # ── goal frame — interactive top/bottom positioning + opacity ───────────────
+    goal_rgb = compose_goal(Path(args.top), Path(args.bottom), args.step)
 
     # ── hardware ──────────────────────────────────────────────────────────────
     cam   = None
