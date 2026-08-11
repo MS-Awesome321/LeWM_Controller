@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from transformers import ViTModel, ViTConfig
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 IMG_SIZE = 224
 EMB_DIM  = 192
 
@@ -94,7 +95,7 @@ def parse_args():
     p = argparse.ArgumentParser(description='Validate the displacement model against two images.')
     p.add_argument('--img1', required=True, help='Path to frame_1')
     p.add_argument('--img2', required=True, help='Path to frame_2')
-    p.add_argument('--ckpt', default='checkpoints/disp_epoch_0080.pt', help='Path to displacement checkpoint (.pt)')
+    p.add_argument('--ckpt', default=str(REPO_ROOT / 'checkpoints' / 'disp_epoch_0080.pt'), help='Path to displacement checkpoint (.pt)')
     p.add_argument('--px_per_mm', type=float, default=1550.0, help='Calibration: pixels per mm')
     return p.parse_args()
 

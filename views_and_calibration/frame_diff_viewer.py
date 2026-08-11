@@ -23,6 +23,7 @@ import cv2
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
+from itertools import chain
 
 FNAME_RE = re.compile(r'([-\d.eE]+)_([-\d.eE]+)_([-\d.eE]+)\.(?:png|jpg|jpeg)$', re.IGNORECASE)
 
@@ -30,7 +31,7 @@ FNAME_RE = re.compile(r'([-\d.eE]+)_([-\d.eE]+)_([-\d.eE]+)\.(?:png|jpg|jpeg)$',
 def parse_args():
     p = argparse.ArgumentParser(description='View the pixel difference between two frames (HDF5 frames or standalone images).')
     p.add_argument('--h5', help='HDF5 filename (e.g. robot_1.hdf5)')
-    p.add_argument('--data_dir', default='data', help='Directory containing the HDF5 file')
+    p.add_argument('--data_dir', default='.', help='Directory containing the HDF5 file')
     p.add_argument('--idx1', type=int, help='Frame index 1 (with --h5)')
     p.add_argument('--idx2', type=int, help='Frame index 2 (with --h5)')
     p.add_argument('--img1', help='Path to image 1 (alternative to --h5/--idx1)')
@@ -113,7 +114,8 @@ def main():
     display_diff = np.clip(signed_diff * args.amplify, -255, 255)
     display_diff_uint = ((display_diff + 255) / 2).astype(np.uint8)   # remap to [0,255] for imshow
 
-    fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(18, 5))
+    axes = list(chain.from_iterable(axes))
 
     axes[0].imshow(frame1)
     axes[0].set_title(label1)

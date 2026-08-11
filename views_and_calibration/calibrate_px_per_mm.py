@@ -22,10 +22,12 @@ import cv2
 import h5py
 import numpy as np
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 
 def parse_args():
     p = argparse.ArgumentParser(description='Interactively calibrate px_per_mm using HDF5 frame pairs.')
-    p.add_argument('--data_dir', default='data', help='Directory containing robot_*.hdf5 files')
+    p.add_argument('--data_dir', default=str(REPO_ROOT / 'data'), help='Directory containing robot_*.hdf5 files')
     p.add_argument('--seed', type=int, default=None, help='Random seed for file/frame selection')
     p.add_argument('--min_sep', type=int, default=50, help='Minimum index separation between the two frames')
     return p.parse_args()

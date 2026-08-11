@@ -1,1 +1,0 @@
-TypeError: No method matches given arguments for GenericAdvancedMotorCLI.MoveJog: (<class 'Thorlabs.MotionControl.GenericMotorCLI.MotorDirection'>)

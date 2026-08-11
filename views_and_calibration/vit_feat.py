@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 from transformers import ViTConfig, ViTModel
 
+REPO_ROOT   = Path(__file__).resolve().parent.parent
 IMG_SIZE    = 224
 PATCH_SIZE  = 16
 EMB_DIM     = 192
@@ -53,8 +54,8 @@ def parse_args():
     p.add_argument('--h5', required=True, help='HDF5 filename (e.g. robot_1.hdf5).')
     p.add_argument('--idx1', type=int, required=True, help='Frame index into --h5.')
     p.add_argument('--idx2', type=int, required=True, help='Frame index into --h5.')
-    p.add_argument('--data_dir', default='data', help='Directory containing the HDF5 file')
-    p.add_argument('--ckpt', default='checkpoints/diff_pred_epoch_0040.pt', help='diff_pred.ipynb checkpoint to load the ViT encoder from')
+    p.add_argument('--data_dir', default=str(REPO_ROOT / 'data'), help='Directory containing the HDF5 file')
+    p.add_argument('--ckpt', default=str(REPO_ROOT / 'checkpoints' / 'diff_pred_epoch_0040.pt'), help='diff_pred.ipynb checkpoint to load the ViT encoder from')
     return p.parse_args()
 
 

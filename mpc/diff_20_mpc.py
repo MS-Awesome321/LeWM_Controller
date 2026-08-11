@@ -1,24 +1,30 @@
 """
-Diff-predictor MPC controller for the nanochemistry transfer stage,
-using the diff-pred ViT trained in diff_pred.ipynb.
+Diff-predictor MPC controller for the nanochemistry transfer stage, using the diff_pred_20x ViT
+trained in diff_pred_20x.ipynb (same architecture/checkpoint schema as diff_mpc.py's diff_pred.ipynb
+model — a single blank ViT run on the blurred difference image blur(goal) - blur(current), regressing
+[Δx, Δy, Δcx, Δcy, Δarea] from its CLS token — but trained on the 20x synthetic top/bottom-composite +
+real-pair mix instead of only real episodes).
 
-Unlike disp_mpc.py's old Siamese-ViT (which encoded current/goal frames
-separately and concatenated their embeddings), this model runs a single ViT
-over the *blurred difference image* blur(goal) - blur(current) and regresses
-[Δx, Δy, Δcx, Δcy, Δarea] from its CLS token in one forward pass. There is no
-reliable *magnitude* Δz signal in this model, so z is not driven proportionally
-like x/y. Instead, control runs in two phases:
+Unlike diff_mpc.py, the goal frame isn't a pre-rendered image file: at startup this script opens an
+interactive 'Goal Composer' window where you position --top over --bottom (WASD/arrows) and set its
+opacity (trackbar), SIFT-registered onto --video exactly the way diff_pred_20x.ipynb's make_sample
+builds its synthetic frame_j (top/bottom warped through the same fitted affine, composited, then
+downsampled to the model's 224x224 input) — so the baked composite you confirm (ENTER/'c') is in the
+same distribution the model was trained on, and becomes the fixed target for the MPC loop below.
+
+Control runs in the same two phases as diff_mpc.py (there's no reliable *magnitude* Δz signal in this
+model):
   1. 'xy' — move by the predicted Δ(x, y) (mm) each step until within --threshold.
-  2. 'z'  — once xy has converged, nudge z by a fixed --z_step each step: if the
-            predicted target ring area is greater than the current ring area
-            (Δarea > 0) move z down, otherwise move z up, until |Δarea| is within
-            --area_threshold (px²).
+  2. 'z'  — once xy has converged, nudge z by a fixed --z_step each step: if the predicted target ring
+            area is greater than the current ring area (Δarea > 0) move z down, otherwise move z up,
+            until |Δarea| is within --area_threshold (px²).
 
 Each MPC step: observe → predict → move (xy or z, depending on phase) → re-observe.
 
 Usage:
-    python diff_mpc.py --goal goal.png --ckpt checkpoints/diff_pred_epoch_0040.pt
-    python diff_mpc.py --goal goal.png --dry_run   # predict only, no robot movement
+    python mpc/diff_20_mpc.py                                   # prompts for a 20X_DropDown/<n> folder
+    python mpc/diff_20_mpc.py --folder 20X_DropDown/2
+    python mpc/diff_20_mpc.py --folder 20X_DropDown/2 --dry_run   # predict only, no robot movement
 
 All distances are in mm (the unit used during training), except Δcx/Δcy/Δarea which are px.
 """
@@ -34,19 +40,22 @@ import torch
 from transformers import ViTModel, ViTConfig
 from torch import nn
 
-sys.path.insert(0, str(Path(__file__).parent))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))   # so `import hardware` resolves regardless of cwd
 
-IMG_SIZE    = 224   # ViT input resolution — unrelated to the camera's native display resolution
+DATA_DIR    = REPO_ROOT / '20X_DropDown'
+IMG_SIZE    = 224   # ViT input resolution — matches diff_pred_20x.ipynb
 PATCH_SIZE  = 16
 EMB_DIM     = 192
-BLUR_SIGMA  = 2.0    # must match diff_pred.ipynb training
+BLUR_SIGMA  = 2.0    # must match diff_pred_20x.ipynb training
+TOP_OPACITY = 0.2    # diff_pred_20x.ipynb's default synthetic-composite opacity — initial trackbar value only
 DRY_RUN_FRAME_SIZE = (960, 540)   # placeholder frame size when --dry_run has no camera attached
 
 DEBOUNCE = 20   # loop iterations to skip after issuing a move
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model definition (must match diff_pred.ipynb exactly)
+# Model definition (must match diff_pred_20x.ipynb exactly)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DisplacementHead(nn.Module):
@@ -136,7 +145,137 @@ def predict_displacement(cur_rgb: np.ndarray, goal_rgb: np.ndarray, vit, head,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Overlay
+# Goal composer — interactive top/bottom positioning + opacity, SIFT-registered onto --video
+# (mirrors diff_pred_20x.ipynb's make_sample synthetic-frame construction exactly)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def label(img: np.ndarray, lines: list[str]) -> np.ndarray:
+    out = img.copy()
+    for idx, text in enumerate(lines):
+        cv2.putText(out, text, (5, 20 + idx * 20), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (0, 255, 0), 1, cv2.LINE_AA)
+    return out
+
+
+def sift_affine(small_gray: np.ndarray, large_gray: np.ndarray, ratio_thresh: float) -> np.ndarray:
+    """SIFT + ratio-test + RANSAC-affine pipeline (same as flake_designer.py / sift_align.py)."""
+    sift = cv2.SIFT_create()
+    kp1, des1 = sift.detectAndCompute(small_gray, None)
+    kp2, des2 = sift.detectAndCompute(large_gray, None)
+
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    knn_matches = matcher.knnMatch(des1, des2, k=2)
+    good = [m for m, n in knn_matches if m.distance < ratio_thresh * n.distance]
+    if len(good) < 3:
+        raise RuntimeError(f'Only {len(good)} good matches — need at least 3 to fit a transform.')
+
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+    M, inlier_mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
+    if M is None:
+        raise RuntimeError('Affine transform estimation failed.')
+    return M
+
+
+def pick_folder() -> Path:
+    folders = sorted(p for p in DATA_DIR.iterdir() if p.is_dir() and (p / 'top.jpg').exists() and (p / 'bottom.jpg').exists())
+    if not folders:
+        raise FileNotFoundError(f'No folders with top.jpg/bottom.jpg found under {DATA_DIR}')
+    print('Available folders (top.jpg/bottom.jpg pairs):')
+    for idx, path in enumerate(folders):
+        print(f'  [{idx}] {path.name}')
+    choice = input(f'Pick a folder [0-{len(folders) - 1}]: ').strip()
+    return folders[int(choice)]
+
+
+def compose_goal(top_path: Path, bottom_path: Path, video_path: Path,
+                 sift_frame: int, ratio_thresh: float, step: int) -> np.ndarray:
+    """Interactive 'Goal Composer' window: position --top over --bottom (WASD/arrows) and set its
+    opacity (trackbar), SIFT-registered onto video_path's sift_frame — ENTER/'c' bakes the current
+    offset+opacity into a fixed IMG_SIZE x IMG_SIZE RGB goal frame; ESC cancels the whole program.
+    """
+    top_full    = cv2.imread(str(top_path))
+    bottom_full = cv2.imread(str(bottom_path))
+    if top_full is None:
+        raise FileNotFoundError(f'Could not read image: {top_path}')
+    if bottom_full is None:
+        raise FileNotFoundError(f'Could not read image: {bottom_path}')
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f'Could not open video: {video_path}')
+    vw, vh = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, sift_frame)
+    ok, ref_frame = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError(f'Could not read frame {sift_frame} from {video_path}')
+
+    bottom_blurred = cv2.GaussianBlur(bottom_full, (15, 15), 0)   # SIFT features only — matches flake_designer.py
+    M = sift_affine(cv2.cvtColor(bottom_blurred, cv2.COLOR_BGR2GRAY),
+                     cv2.cvtColor(ref_frame, cv2.COLOR_BGR2GRAY), ratio_thresh)
+    A, t = M[:, :2], M[:, 2]
+    warped_bottom = cv2.warpAffine(bottom_full, M, (vw, vh))   # fixed — same for every offset
+
+    preview_w = min(vw, 1280)
+    preview_h = int(round(vh * preview_w / vw))
+
+    off_x, off_y = 0.0, 0.0   # (dx, dy) relative to bottom's SIFT-registered position, bottom.jpg's
+                              # native pixel space — same convention as make_sample's offset
+
+    win = 'Goal Composer'
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, preview_w, preview_h)
+    cv2.createTrackbar('opacity', win, int(round(TOP_OPACITY * 100)), 100, lambda _pos: None)
+
+    print(f"Positioning {top_path.name} over {bottom_path.name} (SIFT-registered onto "
+          f"{video_path.name} frame {sift_frame}).")
+    print("WASD/arrows nudge top, 'opacity' trackbar blends it, ENTER/'c' confirms as the MPC goal, ESC cancels.")
+
+    while True:
+        opacity = cv2.getTrackbarPos('opacity', win) / 100.0
+
+        t_top = t + A @ np.array([off_x, off_y], dtype=np.float32)
+        M_top = np.hstack([A, t_top.reshape(2, 1)]).astype(np.float32)
+        warped_top = cv2.warpAffine(top_full, M_top, (vw, vh))
+        composite = cv2.addWeighted(warped_top, opacity, warped_bottom, 1.0 - opacity, 0.0)
+
+        display = cv2.resize(composite, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+        display = label(display, [
+            f'{top_path.name} over {bottom_path.name}',
+            f'offset: ({off_x:+.0f}, {off_y:+.0f}) px (bottom.jpg native space)',
+            f'opacity: {opacity:.2f}',
+            "WASD/arrows nudge, ENTER/'c' confirm, ESC cancel",
+        ])
+        cv2.imshow(win, display)
+
+        key = cv2.waitKey(20) & 0xFF
+        if key == 27:                                        # ESC
+            cv2.destroyWindow(win)
+            raise SystemExit('Cancelled goal composition.')
+        elif key in (13, ord('c')):                          # ENTER / c
+            break
+        elif key in (ord('d'), 83):                          # right / d
+            off_x += step
+        elif key in (ord('a'), 81):                           # left / a
+            off_x -= step
+        elif key in (ord('s'), 84):                           # down / s
+            off_y += step
+        elif key in (ord('w'), 82):                           # up / w
+            off_y -= step
+
+    cv2.destroyWindow(win)
+
+    goal_bgr = cv2.resize(composite, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+    goal_rgb = cv2.cvtColor(goal_bgr, cv2.COLOR_BGR2RGB)
+    print(f'Goal composed: offset=({off_x:+.0f}, {off_y:+.0f}) px, opacity={opacity:.2f} '
+          f'-> {IMG_SIZE}x{IMG_SIZE} goal frame.')
+    return goal_rgb
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live overlay
 # ─────────────────────────────────────────────────────────────────────────────
 
 def draw_overlay(frame_bgr: np.ndarray, step: int) -> np.ndarray:
@@ -148,9 +287,9 @@ def draw_overlay(frame_bgr: np.ndarray, step: int) -> np.ndarray:
     scale = 1.3
     thick = 3
 
-    label = f'Step: {step}'
-    (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
-    cv2.putText(out, label, (w - tw - 10, th + 10), font, scale, (0, 220, 255), thick, cv2.LINE_AA)
+    text = f'Step: {step}'
+    (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+    cv2.putText(out, text, (w - tw - 10, th + 10), font, scale, (0, 220, 255), thick, cv2.LINE_AA)
 
     return out
 
@@ -160,19 +299,27 @@ def draw_overlay(frame_bgr: np.ndarray, step: int) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description='Diff-predictor MPC transfer stage controller.')
-    p.add_argument('--goal',      required=True,       help='Path to goal frame image')
-    p.add_argument('--ckpt',      default='checkpoints/diff_pred_epoch_0040.pt', help='Path to diff-pred checkpoint (.pt). '
-                                                                            'Defaults to latest diff_pred_epoch_*.pt in checkpoints/')
+    p = argparse.ArgumentParser(description='diff_pred_20x MPC controller with an interactive top/bottom goal composer.')
+    p.add_argument('--folder', default=None, help='20X_DropDown/<n> folder providing top.jpg/bottom.jpg/20x.mp4 (prompts if omitted and --top/--bottom/--video are not all given)')
+    p.add_argument('--top',    default=None, help='Top image path (default: <folder>/top.jpg)')
+    p.add_argument('--bottom', default=None, help='Bottom image path (default: <folder>/bottom.jpg)')
+    p.add_argument('--video',  default=None, help='Video used to SIFT-register --bottom (default: <folder>/20x.mp4)')
+    p.add_argument('--sift-frame', type=int, default=0, dest='sift_frame', help='Video frame index used as the SIFT reference frame')
+    p.add_argument('--ratio',  type=float, default=0.75, help="Lowe's ratio test threshold for SIFT match filtering")
+    p.add_argument('--step',   type=int, default=10, help='Native pixels (bottom.jpg space) nudged per key press when positioning --top')
+    p.add_argument('--ckpt',   default=str(REPO_ROOT / 'checkpoints' / 'diff_pred_20x_epoch_0099.pt'),
+                                              help='Path to a diff_pred_20x checkpoint (.pt). Defaults to the latest '
+                                                   'diff_pred_20x_epoch_*.pt in checkpoints/, falling back to '
+                                                   'diff_pred_epoch_0040.pt if none exist yet')
     p.add_argument('--dry_run',   action='store_true', help='Predict with dummy frame, no robot/camera')
     p.add_argument('--no_motion', action='store_true', help='Use live camera but skip robot moves')
-    p.add_argument('--scale',     type=float, default=1,  help='Fraction of predicted Δ to execute per step')
-    p.add_argument('--max_step',  type=float, default=0.1,  help='Max |Δ| per axis per step (mm)')
-    p.add_argument('--threshold', type=float, default=0.05,  help='Goal xy distance threshold (mm)')
+    p.add_argument('--scale',     type=float, default=1,   help='Fraction of predicted Δ to execute per step')
+    p.add_argument('--max_step',  type=float, default=0.1, help='Max |Δ| per axis per step (mm)')
+    p.add_argument('--threshold', type=float, default=0.05, help='Goal xy distance threshold (mm)')
     p.add_argument('--area_threshold', type=float, default=100.0,
                                               help='Goal Newton-ring |Δarea| threshold (px²), checked after xy converges')
-    p.add_argument('--z_step',    type=float, default=0.01, help='Fixed z nudge per step while aligning ring area (mm)')
-    p.add_argument('--debounce',  type=int,   default=DEBOUNCE,
+    p.add_argument('--z_step',   type=float, default=0.01, help='Fixed z nudge per step while aligning ring area (mm)')
+    p.add_argument('--debounce', type=int,   default=DEBOUNCE,
                                               help='Loop iterations to skip after a move')
     return p.parse_args()
 
@@ -181,6 +328,15 @@ def main():
     AXES = ('x', 'y', 'z')
 
     args = parse_args()
+
+    if args.top is None or args.bottom is None or args.video is None:
+        folder = Path(args.folder) if args.folder else pick_folder()
+        if args.top is None:
+            args.top = str(folder / 'top.jpg')
+        if args.bottom is None:
+            args.bottom = str(folder / 'bottom.jpg')
+        if args.video is None:
+            args.video = str(folder / '20x.mp4')
 
     if torch.cuda.is_available():
         device = 'cuda'
@@ -192,22 +348,13 @@ def main():
 
     # ── model ─────────────────────────────────────────────────────────────────
     vit, head = build_model(device)
-
-    ckpt_path = Path(args.ckpt) if args.ckpt else None
-    if ckpt_path is None:
-        candidates = sorted(Path('checkpoints').glob('diff_pred_epoch_*.pt'))
-        if not candidates:
-            raise FileNotFoundError('No diff_pred_epoch_*.pt checkpoints found in checkpoints/.')
-        ckpt_path = candidates[-1]
-
+    ckpt_path = Path(args.ckpt)
     delta_mean, delta_std = load_checkpoint(ckpt_path, vit, head, device)
     blur_kernel = make_gaussian_kernel(BLUR_SIGMA, device)
 
-    # ── goal frame ────────────────────────────────────────────────────────────
-    goal_bgr = cv2.imread(args.goal)
-    if goal_bgr is None:
-        raise FileNotFoundError(f'Cannot read goal image: {args.goal}')
-    goal_rgb = cv2.cvtColor(goal_bgr, cv2.COLOR_BGR2RGB)
+    # ── goal frame — interactive positioning + opacity, SIFT-registered onto --video ───────────
+    goal_rgb = compose_goal(Path(args.top), Path(args.bottom), Path(args.video),
+                            args.sift_frame, args.ratio, args.step)
 
     # ── hardware ──────────────────────────────────────────────────────────────
     cam   = None
@@ -224,8 +371,6 @@ def main():
             from hardware.transfer_control_controller import TransferControl
             robot = TransferControl(only_xyz=True)
             robot.connect()
-            # for ax in AXES:
-            #     robot.set_kst_speed(ax, max_vel=10.0, accel=10000.0, min_vel=0.0)
             p = robot.positions()
             print('Robot connected. Positions:', p)
             position = [float(pos) for _, pos in robot.positions().items()]
@@ -234,8 +379,8 @@ def main():
             print('No-motion mode — camera live, moves skipped.')
 
         # ── cv2 loop ──────────────────────────────────────────────────────────
-        cv2.namedWindow('Diff-MPC', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Diff-MPC', DRY_RUN_FRAME_SIZE[0], DRY_RUN_FRAME_SIZE[1])
+        cv2.namedWindow('Diff-20x-MPC', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Diff-20x-MPC', DRY_RUN_FRAME_SIZE[0], DRY_RUN_FRAME_SIZE[1])
 
         step          = 0
         debounce_i    = 0
@@ -248,11 +393,10 @@ def main():
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             else:
                 frame_rgb = np.zeros((DRY_RUN_FRAME_SIZE[1], DRY_RUN_FRAME_SIZE[0], 3), dtype=np.uint8)
-                print(frame_rgb.shape)
                 frame_bgr = frame_rgb.copy()
 
             display = draw_overlay(frame_bgr, step)
-            cv2.imshow('Diff-MPC', display)
+            cv2.imshow('Diff-20x-MPC', display)
             if cv2.waitKey(1) == 27:   # ESC
                 print('ESC — stopping.')
                 break

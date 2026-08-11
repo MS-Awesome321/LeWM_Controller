@@ -8,8 +8,8 @@ action sequences sampled by CEM, picks the sequence that minimises embedding-spa
 distance to the goal, executes the first action on the robot, then re-plans (MPC loop).
 
 Usage:
-    python cem_mpc.py --goal goal.png --ckpt checkpoints/jepa_epoch_0360.pt
-    python cem_mpc.py --goal goal.png --dry_run   # plan only, no robot movement
+    python mpc/cem_mpc.py --goal goal.png --ckpt checkpoints/jepa_epoch_0360.pt
+    python mpc/cem_mpc.py --goal goal.png --dry_run   # plan only, no robot movement
 
 All distances are in mm (the unit used during training).
 """
@@ -28,7 +28,9 @@ from transformers import ViTModel, ViTConfig
 from torch import nn
 
 # ── local imports ──────────────────────────────────────────────────────────────
-sys.path.insert(0, str(Path(__file__).parent))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))                        # so `import hardware` resolves regardless of cwd
+sys.path.insert(0, str(REPO_ROOT / 'model_notebooks'))    # ldp.py / module.py live here now
 from ldp import LatentDeltaPredictor
 from module import MLP
 
@@ -252,7 +254,7 @@ def main():
 
     ckpt_path = Path(args.ckpt) if args.ckpt else None
     if ckpt_path is None:
-        candidates = sorted(Path('checkpoints').glob('jepa_epoch_*.pt'))
+        candidates = sorted((REPO_ROOT / 'checkpoints').glob('jepa_epoch_*.pt'))
         if not candidates:
             raise FileNotFoundError('No jepa_epoch_*.pt checkpoints found in checkpoints/.')
         ckpt_path = candidates[-1]
