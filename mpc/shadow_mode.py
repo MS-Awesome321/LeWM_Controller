@@ -289,7 +289,8 @@ def main():
             cur_pos = arm.positions()
             real = {axis: cur_pos[axis] - ref_pos[axis] for axis in ('x', 'y', 'z')}
 
-            display = label(frame_bgr, [
+            preview = cv2.resize(frame_bgr, (960, 540), interpolation=cv2.INTER_AREA)
+            display = label(preview, [
                 f'Predicted (cur->goal): dx={pred[0]:+.4f}mm dy={pred[1]:+.4f}mm  dcx={pred[2]:+.2f}px dcy={pred[3]:+.2f}px darea={pred[4]:+.2f}px2',
                 f'Real (since start):    dx={real["x"]:+.4f}mm dy={real["y"]:+.4f}mm dz={real["z"]:+.4f}mm',
             ])
