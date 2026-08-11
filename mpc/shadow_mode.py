@@ -7,9 +7,16 @@ mm moved since shadow mode started, read straight from the motor positions — s
 stage and eyeball how well the model's predictions track real motion. No robot moves are ever issued by
 this script beyond your own key presses.
 
-Controls (identical to manual_control.py):
-    w/a/s/d — jog y+/x+/y-/x-
+The 'Goal Composer' window stays open for the whole program (not just at startup), so you can change the
+goal at any time. OpenCV doesn't report which window is focused, so WASD/arrows can't be routed by "which
+window you clicked into" — instead press 'g' to toggle edit mode: while editing, WASD/arrows nudge the
+composer and stage jogging is suspended; ENTER/'c' bakes the new goal and returns to jogging.
+
+Controls (identical to manual_control.py, except 'g'):
+    w/a/s/d — jog y+/x+/y-/x- (or, in goal-edit mode, nudge the composer overlay)
     q/e     — jog z+/z-
+    g       — toggle goal-edit mode
+    ENTER/c — (goal-edit mode only) bake the composer's current offset/opacity into the goal
     0       — save the current camera frame to images/capture_{x}_{y}_{z}.png
     p       — print current motor positions
     ESC     — stop all axes and quit
@@ -160,11 +167,10 @@ def pick_folder() -> Path:
     return folders[int(choice)]
 
 
-def compose_goal(top_path: Path, bottom_path: Path, step: int) -> np.ndarray:
-    """Interactive 'Goal Composer' window: position --top over --bottom (WASD/arrows) and set its
-    opacity (trackbar) — ENTER/'c' bakes the current offset+opacity into a fixed IMG_SIZE x IMG_SIZE
-    RGB goal frame; ESC cancels the whole program.
-    """
+def init_composer(top_path: Path, bottom_path: Path) -> dict:
+    """Load top/bottom and open the 'Goal Composer' window (with its opacity trackbar). The window
+    and returned state stay alive for the whole program, so the goal can be re-baked at any time —
+    see render_composer()/nudge_composer()/bake_goal()."""
     top_full    = cv2.imread(str(top_path))
     bottom_full = cv2.imread(str(bottom_path))
     if top_full is None:
@@ -176,54 +182,52 @@ def compose_goal(top_path: Path, bottom_path: Path, step: int) -> np.ndarray:
     preview_w = min(w, 1280)
     preview_h = int(round(h * preview_w / w))
 
-    off_x, off_y = 0.0, 0.0   # (dx, dy) in top.jpg/bottom.jpg's shared native pixel space
-
     win = 'Goal Composer'
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, preview_w, preview_h)
     cv2.createTrackbar('opacity', win, int(round(TOP_OPACITY * 100)), 100, lambda _pos: None)
 
-    print(f'Positioning {top_path.name} over {bottom_path.name}.')
-    print("WASD/arrows nudge top, 'opacity' trackbar blends it, ENTER/'c' confirms as the shadow-mode goal, ESC cancels.")
+    return {
+        'win': win, 'top_path': top_path, 'bottom_path': bottom_path,
+        'top_full': top_full, 'bottom_full': bottom_full,
+        'h': h, 'w': w, 'preview_w': preview_w, 'preview_h': preview_h,
+        'off_x': 0.0, 'off_y': 0.0, 'composite': bottom_full.copy(),
+    }
 
-    while True:
-        opacity = cv2.getTrackbarPos('opacity', win) / 100.0
 
-        M_top = np.array([[1.0, 0.0, off_x], [0.0, 1.0, off_y]], dtype=np.float32)
-        warped_top = cv2.warpAffine(top_full, M_top, (w, h))
-        composite = cv2.addWeighted(warped_top, opacity, bottom_full, 1.0 - opacity, 0.0)
+def render_composer(c: dict, editing: bool) -> np.ndarray:
+    """Recompute the composite from c's current offset + the opacity trackbar and redraw the
+    composer window. Returns the full-resolution BGR composite (bake_goal() turns it into a goal)."""
+    opacity = cv2.getTrackbarPos('opacity', c['win']) / 100.0
+    M = np.array([[1.0, 0.0, c['off_x']], [0.0, 1.0, c['off_y']]], dtype=np.float32)
+    warped_top = cv2.warpAffine(c['top_full'], M, (c['w'], c['h']))
+    composite = cv2.addWeighted(warped_top, opacity, c['bottom_full'], 1.0 - opacity, 0.0)
+    c['composite'] = composite
 
-        display = cv2.resize(composite, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
-        display = label(display, [
-            f'{top_path.name} over {bottom_path.name}',
-            f'offset: ({off_x:+.0f}, {off_y:+.0f}) px',
-            f'opacity: {opacity:.2f}',
-            "WASD/arrows nudge, ENTER/'c' confirm, ESC cancel",
-        ])
-        cv2.imshow(win, display)
+    display = cv2.resize(composite, (c['preview_w'], c['preview_h']), interpolation=cv2.INTER_AREA)
+    display = label(display, [
+        f"{c['top_path'].name} over {c['bottom_path'].name}",
+        f'offset: ({c["off_x"]:+.0f}, {c["off_y"]:+.0f}) px   opacity: {opacity:.2f}',
+        "EDITING - WASD/arrows nudge, ENTER/'c' bake, g to lock" if editing else "locked - press g to edit",
+    ])
+    cv2.imshow(c['win'], display)
+    return composite
 
-        key = cv2.waitKey(20) & 0xFF
-        if key == 27:                                        # ESC
-            cv2.destroyWindow(win)
-            raise SystemExit('Cancelled goal composition.')
-        elif key in (13, ord('c')):                          # ENTER / c
-            break
-        elif key in (ord('d'), 83):                          # right / d
-            off_x += step
-        elif key in (ord('a'), 81):                           # left / a
-            off_x -= step
-        elif key in (ord('s'), 84):                           # down / s
-            off_y += step
-        elif key in (ord('w'), 82):                           # up / w
-            off_y -= step
 
-    cv2.destroyWindow(win)
+def nudge_composer(c: dict, key: int, step: int) -> None:
+    if key in (ord('d'), 83):                          # right / d
+        c['off_x'] += step
+    elif key in (ord('a'), 81):                          # left / a
+        c['off_x'] -= step
+    elif key in (ord('s'), 84):                          # down / s
+        c['off_y'] += step
+    elif key in (ord('w'), 82):                          # up / w
+        c['off_y'] -= step
 
+
+def bake_goal(composite: np.ndarray) -> np.ndarray:
     goal_bgr = cv2.resize(composite, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
-    goal_rgb = cv2.cvtColor(goal_bgr, cv2.COLOR_BGR2RGB)
-    print(f'Goal composed: offset=({off_x:+.0f}, {off_y:+.0f}) px, opacity={opacity:.2f} '
-          f'-> {IMG_SIZE}x{IMG_SIZE} goal frame.')
-    return goal_rgb
+    return cv2.cvtColor(goal_bgr, cv2.COLOR_BGR2RGB)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,8 +268,22 @@ def main():
     delta_mean, delta_std = load_checkpoint(Path(args.ckpt), vit, head, device)
     blur_kernel = make_gaussian_kernel(BLUR_SIGMA, device)
 
-    # ── goal frame — interactive top/bottom positioning + opacity ───────────────
-    goal_rgb = compose_goal(Path(args.top), Path(args.bottom), args.step)
+    # ── goal composer — stays open for the whole program, not just at startup ───
+    c = init_composer(Path(args.top), Path(args.bottom))
+    print(f'Positioning {c["top_path"].name} over {c["bottom_path"].name}.')
+    print("WASD/arrows nudge top, 'opacity' trackbar blends it, ENTER/'c' confirms the initial goal, ESC cancels.")
+    while True:
+        render_composer(c, editing=True)
+        key = cv2.waitKey(20) & 0xFF
+        if key == 27:                                        # ESC
+            cv2.destroyAllWindows()
+            raise SystemExit('Cancelled goal composition.')
+        elif key in (13, ord('c')):                          # ENTER / c
+            break
+        else:
+            nudge_composer(c, key, args.step)
+    goal_rgb = bake_goal(c['composite'])
+    print(f'Goal composed: offset=({c["off_x"]:+.0f}, {c["off_y"]:+.0f}) px -> {IMG_SIZE}x{IMG_SIZE} goal frame.')
 
     cam = None
     arm = None
@@ -280,6 +298,7 @@ def main():
         print('Robot connected. Reference positions:', ref_pos)
 
         i = 0
+        editing_goal = False
         while True:
             frame_bgr = cam.snap()
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -295,10 +314,28 @@ def main():
                 f'Real (since start):    dx={real["x"]:+.4f}mm dy={real["y"]:+.4f}mm dz={real["z"]:+.4f}mm',
             ])
             cv2.imshow('Shadow Mode', display)
+            render_composer(c, editing=editing_goal)
 
             key = cv2.waitKey(1)
 
-            if i >= 0:
+            if key == 27:   # ESC — always quits, whether editing the goal or jogging
+                print("Stopping All")
+                if not editing_goal:
+                    arm.stop_xyz()
+                break
+            elif key == ord('g'):
+                editing_goal = not editing_goal
+                if editing_goal:
+                    arm.stop_xyz()
+                print('Editing goal (WASD/arrows nudge, ENTER/c bake)' if editing_goal else 'Goal locked')
+            elif editing_goal:
+                if key in (13, ord('c')):
+                    goal_rgb = bake_goal(c['composite'])
+                    editing_goal = False
+                    print(f'Goal updated: offset=({c["off_x"]:+.0f}, {c["off_y"]:+.0f}) px.')
+                else:
+                    nudge_composer(c, key, args.step)
+            elif i >= 0:
                 if key == 123 or key == 97:   # a
                     print('Left')
                     i = -DEBOUNCE
@@ -330,10 +367,6 @@ def main():
                     print(f'Saved {fname}')
                 elif key == 112:   # p
                     print(arm.positions())
-                elif key == 27:   # ESC
-                    print("Stopping All")
-                    arm.stop_xyz()
-                    break
                 else:
                     arm.stop_xyz()
 
