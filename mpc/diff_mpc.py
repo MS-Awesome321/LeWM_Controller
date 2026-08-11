@@ -17,8 +17,9 @@ like x/y. Instead, control runs in two phases:
 Each MPC step: observe → predict → move (xy or z, depending on phase) → re-observe.
 
 Usage:
-    python mpc/diff_mpc.py --goal goal.png --ckpt checkpoints/diff_pred_epoch_0040.pt
-    python mpc/diff_mpc.py --goal goal.png --dry_run   # predict only, no robot movement
+    python diff_mpc.py --goal goal.png --ckpt checkpoints/diff_pred_epoch_0040.pt
+    python diff_mpc.py --goal goal.png --dry_run   # predict only, no robot movement
+    python diff_mpc.py --goal goal.png --record    # save video to ./demo.mp4
 
 All distances are in mm (the unit used during training), except Δcx/Δcy/Δarea which are px.
 """
@@ -171,11 +172,12 @@ def parse_args():
     p.add_argument('--scale',     type=float, default=1,  help='Fraction of predicted Δ to execute per step')
     p.add_argument('--max_step',  type=float, default=0.1,  help='Max |Δ| per axis per step (mm)')
     p.add_argument('--threshold', type=float, default=0.05,  help='Goal xy distance threshold (mm)')
-    p.add_argument('--area_threshold', type=float, default=100.0,
+    p.add_argument('--area_threshold', type=float, default=500.0,
                                               help='Goal Newton-ring |Δarea| threshold (px²), checked after xy converges')
-    p.add_argument('--z_step',    type=float, default=0.01, help='Fixed z nudge per step while aligning ring area (mm)')
+    p.add_argument('--z_step',    type=float, default=0.005, help='Fixed z nudge per step while aligning ring area (mm)')
     p.add_argument('--debounce',  type=int,   default=DEBOUNCE,
                                               help='Loop iterations to skip after a move')
+    p.add_argument('--record',    action='store_true', help='Record displayed frames to ./demo.mp4')
     return p.parse_args()
 
 
@@ -214,6 +216,7 @@ def main():
     # ── hardware ──────────────────────────────────────────────────────────────
     cam   = None
     robot = None
+    video_writer = None
     position = []
 
     try:
@@ -254,6 +257,23 @@ def main():
                 frame_bgr = frame_rgb.copy()
 
             display = draw_overlay(frame_bgr, step)
+            if args.record:
+                if video_writer is None:
+                    height, width = display.shape[:2]
+                    output_path = Path.cwd() / 'demo.mp4'
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    video_writer = cv2.VideoWriter(
+                        str(output_path),
+                        fourcc,
+                        15.0,
+                        (width, height),
+                    )
+                    if not video_writer.isOpened():
+                        raise RuntimeError(f'Cannot open video writer: {output_path}')
+                    print(f'Recording video to {output_path}')
+
+                video_writer.write(display)
+
             cv2.imshow('Diff-MPC', display)
             if cv2.waitKey(1) == 27:   # ESC
                 print('ESC — stopping.')
@@ -300,7 +320,7 @@ def main():
                     break
 
                 # target ring area greater than current -> move down; otherwise up.
-                move_z = -args.z_step if pred_area > 0 else args.z_step
+                move_z = args.z_step if pred_area > 0 else -args.z_step
 
                 if robot is not None:
                     position[2] += move_z
@@ -325,6 +345,9 @@ def main():
             print('Done.')
         if cam is not None:
             cam.stop()
+        if video_writer is not None:
+            video_writer.release()
+            print(f'Video saved to {Path.cwd() / "demo.mp4"}')
         cv2.destroyAllWindows()
 
 

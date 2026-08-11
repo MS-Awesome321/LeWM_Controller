@@ -56,7 +56,7 @@ try:
                 arm.jog_axis('z', '-')
             elif key == 48:   # 0
                 pos = arm.positions()
-                fname = f"capture_{pos['x']}_{pos['y']}_{pos['z']}.png"
+                fname = f"images/capture_{pos['x']}_{pos['y']}_{pos['z']}.png"
                 cv2.imwrite(fname, frame)
                 print(f'Saved {fname}')
             elif key == 112:  # p
