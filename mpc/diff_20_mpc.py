@@ -136,7 +136,7 @@ def predict_displacement(cur_rgb: np.ndarray, goal_rgb: np.ndarray, vit, head,
     """Predicted [Δx, Δy, Δcx, Δcy, Δarea] (mm, mm, px, px, px²) to move from cur → goal."""
     cur  = to_float_frame(cur_rgb, device)
     goal = to_float_frame(goal_rgb, device)
-    diff = gaussian_blur(goal, blur_kernel) - gaussian_blur(cur, blur_kernel)
+    diff = gaussian_blur(cur, blur_kernel) - gaussian_blur(goal, blur_kernel)
     cls_token = vit(diff, interpolate_pos_encoding=False).last_hidden_state[:, 0]
     pred_norm = head(cls_token)
     pred_raw  = pred_norm * delta_std + delta_mean
@@ -271,7 +271,7 @@ def parse_args():
     p.add_argument('--no_motion', action='store_true', help='Use live camera but skip robot moves')
     p.add_argument('--scale',     type=float, default=1,   help='Fraction of predicted Δ to execute per step')
     p.add_argument('--max_step',  type=float, default=0.1, help='Max |Δ| per axis per step (mm)')
-    p.add_argument('--threshold', type=float, default=0.05, help='Goal xy distance threshold (mm)')
+    p.add_argument('--threshold', type=float, default=0.005, help='Goal xy distance threshold (mm)')
     p.add_argument('--area_threshold', type=float, default=100.0,
                                               help='Goal Newton-ring |Δarea| threshold (px²), checked after xy converges')
     p.add_argument('--z_step',   type=float, default=0.01, help='Fixed z nudge per step while aligning ring area (mm)')
@@ -390,20 +390,21 @@ def main():
                     print(f'  move x by {move_xy[0]:+.4f} mm, y by {move_xy[1]:+.4f} mm  (no-op)')
 
             else:   # phase == 'z'
-                if abs(pred_area) < args.area_threshold:
-                    print(f'Goal reached. xy={dist:.4f} mm away, |Δarea|={abs(pred_area):.2f} px² away.')
-                    break
+                break
+                # if abs(pred_area) < args.area_threshold:
+                #     print(f'Goal reached. xy={dist:.4f} mm away, |Δarea|={abs(pred_area):.2f} px² away.')
+                #     break
 
-                # target ring area greater than current -> move down; otherwise up.
-                move_z = -args.z_step if pred_area > 0 else args.z_step
+                # # target ring area greater than current -> move down; otherwise up.
+                # move_z = -args.z_step if pred_area > 0 else args.z_step
 
-                if robot is not None:
-                    position[2] += move_z
-                    print(f'  move z to {position[2]:+.4f} mm  (Δarea={pred_area:+.2f} px²)')
-                    robot.move_axis_to('z', position[2])
-                    debounce_i = args.debounce
-                else:
-                    print(f'  move z by {move_z:+.4f} mm  (Δarea={pred_area:+.2f} px²)  (no-op)')
+                # if robot is not None:
+                #     position[2] += move_z
+                #     print(f'  move z to {position[2]:+.4f} mm  (Δarea={pred_area:+.2f} px²)')
+                #     robot.move_axis_to('z', position[2])
+                #     debounce_i = args.debounce
+                # else:
+                #     print(f'  move z by {move_z:+.4f} mm  (Δarea={pred_area:+.2f} px²)  (no-op)')
 
             step += 1
 

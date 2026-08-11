@@ -62,7 +62,7 @@ try:
             elif key == 112:  # p
                 print(arm.positions())
             elif key == 27:   # ESC
-                print("Stopping All: ", key)
+                print("Stopping All")
                 arm.stop_xyz()
                 break
             else:
