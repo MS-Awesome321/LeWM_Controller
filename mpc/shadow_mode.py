@@ -3,8 +3,10 @@ Shadow mode: manually jog the stage (same controls as manual_control.py) while t
 continuously watches the live camera feed and predicts the displacement to a fixed goal frame, composed
 the same way as in diff_20_mpc.py (position --top over --bottom, WASD/arrows + opacity trackbar, ENTER/'c'
 to confirm). The predicted displacement is shown on screen next to the "real" displacement — the actual
-mm moved since shadow mode started, read straight from the motor positions — so you can manually drive the
-stage and eyeball how well the model's predictions track real motion. No robot moves are ever issued by
+mm moved since a reference motor position, read straight from the motor positions — so you can manually
+drive the stage and eyeball how well the model's predictions track real motion. The reference position
+starts out as wherever the stage was on connect, and can be reset to the current position at any time with
+'m', so you aren't stuck comparing against the stage's start-up position. No robot moves are ever issued by
 this script beyond your own key presses.
 
 The 'Goal Composer' window stays open for the whole program (not just at startup), so you can change the
@@ -12,10 +14,11 @@ goal at any time. OpenCV doesn't report which window is focused, so WASD/arrows 
 window you clicked into" — instead press 'g' to toggle edit mode: while editing, WASD/arrows nudge the
 composer and stage jogging is suspended; ENTER/'c' bakes the new goal and returns to jogging.
 
-Controls (identical to manual_control.py, except 'g'):
+Controls (identical to manual_control.py, except 'g'/'m'):
     w/a/s/d — jog y+/x+/y-/x- (or, in goal-edit mode, nudge the composer overlay)
     q/e     — jog z+/z-
     g       — toggle goal-edit mode
+    m       — set the current motor position as the reference point for "Real (since start)"
     ENTER/c — (goal-edit mode only) bake the composer's current offset/opacity into the goal
     0       — save the current camera frame to images/capture_{x}_{y}_{z}.png
     p       — print current motor positions
@@ -311,7 +314,7 @@ def main():
             preview = cv2.resize(frame_bgr, (960, 540), interpolation=cv2.INTER_AREA)
             display = label(preview, [
                 f'Predicted (cur->goal): dx={pred[0]:+.4f}mm dy={pred[1]:+.4f}mm  dcx={pred[2]:+.2f}px dcy={pred[3]:+.2f}px darea={pred[4]:+.2f}px2',
-                f'Real (since start):    dx={real["x"]:+.4f}mm dy={real["y"]:+.4f}mm dz={real["z"]:+.4f}mm',
+                f'Real (since ref, m to reset): dx={real["x"]:+.4f}mm dy={real["y"]:+.4f}mm dz={real["z"]:+.4f}mm',
             ])
             cv2.imshow('Shadow Mode', display)
             render_composer(c, editing=editing_goal)
@@ -328,6 +331,9 @@ def main():
                 if editing_goal:
                     arm.stop_xyz()
                 print('Editing goal (WASD/arrows nudge, ENTER/c bake)' if editing_goal else 'Goal locked')
+            elif key == ord('m'):
+                ref_pos = arm.positions()
+                print('Reference position set:', ref_pos)
             elif editing_goal:
                 if key in (13, ord('c')):
                     goal_rgb = bake_goal(c['composite'])
