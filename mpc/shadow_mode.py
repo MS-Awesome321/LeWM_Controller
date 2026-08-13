@@ -168,7 +168,8 @@ def label(img: np.ndarray, lines: list[str]) -> np.ndarray:
 
 
 def sift_affine(small_gray: np.ndarray, large_gray: np.ndarray, ratio_thresh: float) -> np.ndarray:
-    """SIFT + ratio-test + RANSAC-affine pipeline (same as flake_designer.py/sift_align.py)."""
+    """SIFT + ratio-test pipeline, restricted to a translation-only fit (no rotation/scale/shear):
+    the translation is the median of matched keypoints' displacement vectors, robust to outlier matches."""
     sift = cv2.SIFT_create()
     kp1, des1 = sift.detectAndCompute(small_gray, None)
     kp2, des2 = sift.detectAndCompute(large_gray, None)
@@ -179,12 +180,11 @@ def sift_affine(small_gray: np.ndarray, large_gray: np.ndarray, ratio_thresh: fl
     if len(good) < 3:
         raise RuntimeError(f'Only {len(good)} good matches — need at least 3 to fit a transform.')
 
-    src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good])
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good])
 
-    M, inlier_mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
-    if M is None:
-        raise RuntimeError('Affine transform estimation failed.')
+    tx, ty = np.median(dst_pts - src_pts, axis=0)
+    M = np.array([[1.0, 0.0, tx], [0.0, 1.0, ty]], dtype=np.float32)
     return M
 
 
