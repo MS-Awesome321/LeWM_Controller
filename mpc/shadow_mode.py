@@ -1,31 +1,33 @@
 """
 Shadow mode: manually jog the stage (same controls as manual_control.py) while the diff_pred_20x ViT
-continuously watches the live camera feed and predicts the displacement to a fixed goal frame, composed
-the same way as in diff_20_mpc.py (position --top over --bottom, WASD/arrows + opacity trackbar, ENTER/'c'
-to confirm). The predicted displacement is shown on screen next to the "real" displacement — the actual
-mm moved since a reference motor position, read straight from the motor positions — so you can manually
-drive the stage and eyeball how well the model's predictions track real motion. The reference position
-starts out as wherever the stage was on connect, and can be reset to the current position at any time with
-'m', so you aren't stuck comparing against the stage's start-up position. No robot moves are ever issued by
-this script beyond your own key presses.
+continuously watches the live camera feed and predicts the displacement to a goal frame composed from
+--top over --bottom (WASD/arrows + opacity trackbar, same as diff_20_mpc.py), with --bottom SIFT-registered
+onto the live camera's coordinate frame (same registration pattern as flake_designer.py) so the goal is
+always expressed in the camera's own field of view. The predicted displacement is shown on screen next to
+the "real" displacement — the actual mm moved since a reference motor position, read straight from the
+motor positions — so you can manually drive the stage and eyeball how well the model's predictions track
+real motion. The reference position starts out as wherever the stage was on connect, and can be reset to
+the current position at any time with 'm'. No robot moves are ever issued by this script beyond your own
+key presses.
 
-Everything lives in one window: the live camera feed, the goal composite (top.jpg over bottom.jpg,
-positioned/blended live), and a heatmap of |blur(current) - blur(goal)| — the same diff the ViT actually
-regresses on — side by side, with predicted vs. real displacement printed underneath. There's no separate
-blocking "confirm the goal" step; the goal starts out as whatever the composer's default offset/opacity is
-and can be repositioned at any time.
+Everything lives in one window: the live camera feed, the goal (top+bottom, positioned live and SIFT-warped
+onto the live view's frame), and a heatmap of |blur(current) - blur(goal)| — the same diff the ViT actually
+regresses on — side by side, with predicted vs. real displacement printed underneath. The goal is fully live:
+every one of these three panels, and the ViT's input, is recomputed from scratch every loop iteration
+directly from the current top/bottom offsets — there's no "confirm"/"bake" step, exactly like the live
+camera view itself.
 
 WASD/arrows are shared between jogging the stage and nudging the goal composite, since OpenCV can't tell
-which panel you "clicked into" — press 'g' to switch between the two: while editing, WASD/arrows nudge the
-composite and stage jogging is suspended; ENTER/'c' bakes the composite into the goal used for prediction
-and switches back to jogging.
+which panel you "clicked into" — press 'g' to nudge --top's position over --bottom, or 'h' to nudge
+--bottom's position (a manual offset on top of the one-time SIFT registration onto the live view); either
+one suspends stage jogging until you press it again to go back to jog mode.
 
-Controls (identical to manual_control.py, except 'g'/'m'):
-    w/a/s/d — jog y+/x+/y-/x- (or, in goal-edit mode, nudge the goal composite)
+Controls (identical to manual_control.py, except 'g'/'h'/'m'):
+    w/a/s/d — jog y+/x+/y-/x- (or, in an edit mode, nudge the top/bottom position)
     q/e     — jog z+/z-
-    g       — toggle goal-edit mode
+    g       — toggle "edit top" mode (WASD/arrows move --top over --bottom)
+    h       — toggle "edit bottom" mode (WASD/arrows move --bottom's SIFT-registered position)
     m       — set the current motor position as the reference point for "Real (since start)"
-    ENTER/c — (goal-edit mode only) bake the composite's current offset/opacity into the goal
     0       — save the current camera frame to images/capture_{x}_{y}_{z}.png
     p       — print current motor positions
     ESC     — stop all axes and quit
@@ -165,6 +167,27 @@ def label(img: np.ndarray, lines: list[str]) -> np.ndarray:
     return out
 
 
+def sift_affine(small_gray: np.ndarray, large_gray: np.ndarray, ratio_thresh: float) -> np.ndarray:
+    """SIFT + ratio-test + RANSAC-affine pipeline (same as flake_designer.py/sift_align.py)."""
+    sift = cv2.SIFT_create()
+    kp1, des1 = sift.detectAndCompute(small_gray, None)
+    kp2, des2 = sift.detectAndCompute(large_gray, None)
+
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    knn_matches = matcher.knnMatch(des1, des2, k=2)
+    good = [m for m, n in knn_matches if m.distance < ratio_thresh * n.distance]
+    if len(good) < 3:
+        raise RuntimeError(f'Only {len(good)} good matches — need at least 3 to fit a transform.')
+
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+    M, inlier_mask = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
+    if M is None:
+        raise RuntimeError('Affine transform estimation failed.')
+    return M
+
+
 def pick_folder() -> Path:
     folders = sorted(p for p in DATA_DIR.iterdir() if p.is_dir() and (p / 'top.jpg').exists() and (p / 'bottom.jpg').exists())
     if not folders:
@@ -178,8 +201,8 @@ def pick_folder() -> Path:
 
 def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
     """Load top/bottom and attach an 'opacity' trackbar to the (already-created) unified window.
-    The returned state stays alive for the whole program, so the goal can be re-baked at any time —
-    see update_composite()/nudge_composer()/bake_goal()."""
+    The returned state stays alive for the whole program and is recomputed every frame — see
+    update_composite()/nudge_xy()/warp_goal_to_live()/bake_goal()."""
     top_full    = cv2.imread(str(top_path))
     bottom_full = cv2.imread(str(bottom_path))
     if top_full is None:
@@ -195,6 +218,7 @@ def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
         'top_full': top_full, 'bottom_full': bottom_full,
         'h': h, 'w': w,
         'off_x': 0.0, 'off_y': 0.0, 'composite': bottom_full.copy(),
+        'bx': 0.0, 'by': 0.0,   # manual offset of --bottom on top of its SIFT-registered position
     }
 
 
@@ -210,19 +234,32 @@ def update_composite(c: dict) -> np.ndarray:
     return composite
 
 
-def nudge_composer(c: dict, key: int, step: int) -> None:
+def nudge_xy(state: dict, key: int, step: int, x_key: str, y_key: str) -> None:
+    """Nudge state[x_key]/state[y_key] by WASD/arrows — used for both --top's offset over --bottom
+    and --bottom's manual offset on top of its SIFT-registered position."""
     if key in (ord('d'), 83):                          # right / d
-        c['off_x'] += step
+        state[x_key] += step
     elif key in (ord('a'), 81):                          # left / a
-        c['off_x'] -= step
+        state[x_key] -= step
     elif key in (ord('s'), 84):                          # down / s
-        c['off_y'] += step
+        state[y_key] += step
     elif key in (ord('w'), 82):                          # up / w
-        c['off_y'] -= step
+        state[y_key] -= step
 
 
-def bake_goal(composite: np.ndarray) -> np.ndarray:
-    goal_bgr = cv2.resize(composite, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+def warp_goal_to_live(composite: np.ndarray, sift_M: np.ndarray, bx: float, by: float,
+                      live_w: int, live_h: int) -> np.ndarray:
+    """Warp the (--bottom-space) composite onto the live camera's coordinate frame using the one-time
+    SIFT fit, folding in the manual --bottom offset (bx, by) the same way flake_designer.py folds --top's
+    offset into its SIFT fit."""
+    A, t = sift_M[:, :2], sift_M[:, 2]
+    t_adj = t + A @ np.array([bx, by], dtype=np.float32)
+    M_adj = np.hstack([A, t_adj.reshape(2, 1)]).astype(np.float32)
+    return cv2.warpAffine(composite, M_adj, (live_w, live_h))
+
+
+def bake_goal(warped_goal: np.ndarray) -> np.ndarray:
+    goal_bgr = cv2.resize(warped_goal, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
     return cv2.cvtColor(goal_bgr, cv2.COLOR_BGR2RGB)
 
 
@@ -245,8 +282,8 @@ def diff_mag_image(cur_rgb: np.ndarray, goal_rgb: np.ndarray) -> np.ndarray:
 
 
 def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarray,
-                 editing: bool, pred: np.ndarray, real: dict, c: dict) -> np.ndarray:
-    """Combine the live feed, goal composite, and diff-mag heatmap into one canvas, with a status
+                 mode: str, pred: np.ndarray, real: dict, c: dict) -> np.ndarray:
+    """Combine the live feed, SIFT-warped goal, and diff-mag heatmap into one canvas, with a status
     strip (mode + predicted/real displacement) underneath."""
     panel_h = 420
 
@@ -256,14 +293,21 @@ def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarra
         return cv2.resize(img, (w, panel_h), interpolation=cv2.INTER_AREA)
 
     live_p = label(fit(live_bgr), ['LIVE'])
-    goal_p = label(fit(goal_bgr), ['GOAL', f'offset=({c["off_x"]:+.0f},{c["off_y"]:+.0f}) op={c.get("opacity", 0.0):.2f}'])
+    goal_p = label(fit(goal_bgr), [
+        'GOAL (SIFT-aligned to live)',
+        f'top=({c["off_x"]:+.0f},{c["off_y"]:+.0f}) op={c.get("opacity", 0.0):.2f}',
+        f'bottom=({c["bx"]:+.0f},{c["by"]:+.0f})',
+    ])
     diff_p = label(fit(diff_bgr), ['DIFF MAG |cur-goal|'])
 
     top = np.hstack([live_p, goal_p, diff_p])
 
     status = np.zeros((70, top.shape[1], 3), dtype=np.uint8)
-    mode_line = ("EDITING GOAL - WASD/arrows nudge, ENTER/'c' bake, g to lock" if editing else
-                 "JOG MODE - w/a/s/d/q/e move stage, g to edit goal, m to set reference")
+    mode_line = {
+        'edit_top':    "EDIT TOP - WASD/arrows move top over bottom, g to lock",
+        'edit_bottom': "EDIT BOTTOM - WASD/arrows move bottom's SIFT-registered position, h to lock",
+        'jog':         "JOG MODE - w/a/s/d/q/e move stage, g to edit top, h to edit bottom, m to set reference",
+    }[mode]
     status = label(status, [
         mode_line,
         f'Predicted (cur->goal): dx={pred[0]:+.4f}mm dy={pred[1]:+.4f}mm  dcx={pred[2]:+.2f}px dcy={pred[3]:+.2f}px darea={pred[4]:+.2f}px2',
@@ -282,7 +326,8 @@ def parse_args():
     p.add_argument('--folder', default=None, help='20X_DropDown/<n> folder providing top.jpg/bottom.jpg (prompts if omitted and --top/--bottom are not both given)')
     p.add_argument('--top',    default=None, help='Top image path (default: <folder>/top.jpg)')
     p.add_argument('--bottom', default=None, help='Bottom image path (default: <folder>/bottom.jpg)')
-    p.add_argument('--step',   type=int, default=10, help='Pixels nudged per key press when positioning --top over --bottom')
+    p.add_argument('--step',   type=int, default=10, help='Pixels nudged per key press when positioning --top over --bottom, or --bottom over the live view')
+    p.add_argument('--ratio',  type=float, default=0.75, help="Lowe's ratio test threshold for the one-time SIFT registration of --bottom onto the live view")
     p.add_argument('--ckpt',   default=str(REPO_ROOT / 'checkpoints' / 'diff_pred_20x_epoch_0099.pt'),
                                               help='Path to a diff_pred_20x checkpoint (.pt)')
     return p.parse_args()
@@ -317,9 +362,7 @@ def main():
     cv2.resizeWindow(WIN, 1600, 500)
 
     c = init_composer(Path(args.top), Path(args.bottom), WIN)
-    goal_rgb = bake_goal(update_composite(c))
-    print(f'Positioning {c["top_path"].name} over {c["bottom_path"].name} — starting goal: '
-          f'offset=({c["off_x"]:+.0f}, {c["off_y"]:+.0f}) px. Press g to edit it at any time.')
+    print(f'Positioning {c["top_path"].name} over {c["bottom_path"].name}. Press g to move top, h to move bottom.')
 
     cam = None
     arm = None
@@ -327,48 +370,63 @@ def main():
         cam = CameraController(index=0, fps=15)
         cam.start()
 
+        # One-time SIFT registration of --bottom onto the live camera's coordinate frame (same
+        # pattern as flake_designer.py) — features detected on a blurred copy, fit reused every frame.
+        ref_frame_bgr = cam.snap()
+        bottom_blurred = cv2.GaussianBlur(c['bottom_full'], (15, 15), 0)
+        sift_M = sift_affine(cv2.cvtColor(bottom_blurred, cv2.COLOR_BGR2GRAY),
+                             cv2.cvtColor(ref_frame_bgr, cv2.COLOR_BGR2GRAY), args.ratio)
+        print('SIFT-registered bottom onto the live view. Press h to adjust its position manually.')
+
         arm = TransferControl(only_xyz=True)
         ref_pos = arm.positions()
         print('Robot connected. Reference positions:', ref_pos)
 
         i = 0
-        editing_goal = False
+        mode = 'jog'   # 'jog' | 'edit_top' | 'edit_bottom'
         while True:
             frame_bgr = cam.snap()
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            live_h, live_w = frame_bgr.shape[:2]
+
+            # goal is recomputed fresh every iteration — no bake/confirm step, exactly like the live view
+            composite   = update_composite(c)
+            warped_goal = warp_goal_to_live(composite, sift_M, c['bx'], c['by'], live_w, live_h)
+            goal_rgb    = bake_goal(warped_goal)
 
             pred = predict_displacement(frame_rgb, goal_rgb, vit, head, blur_kernel,
                                         delta_mean, delta_std, device)
             cur_pos = arm.positions()
             real = {axis: cur_pos[axis] - ref_pos[axis] for axis in ('x', 'y', 'z')}
 
-            composite = update_composite(c)
-            diff_img  = diff_mag_image(frame_rgb, goal_rgb)
-            canvas    = compose_view(frame_bgr, composite, diff_img, editing_goal, pred, real, c)
+            diff_img = diff_mag_image(frame_rgb, goal_rgb)
+            canvas   = compose_view(frame_bgr, warped_goal, diff_img, mode, pred, real, c)
             cv2.imshow(WIN, canvas)
 
             key = cv2.waitKey(1)
 
             if key == 27:   # ESC — always quits, whether editing the goal or jogging
                 print("Stopping All")
-                if not editing_goal:
+                if mode == 'jog':
                     arm.stop_xyz()
                 break
             elif key == ord('g'):
-                editing_goal = not editing_goal
-                if editing_goal:
+                mode = 'jog' if mode == 'edit_top' else 'edit_top'
+                if mode != 'jog':
                     arm.stop_xyz()
-                print('Editing goal (WASD/arrows nudge, ENTER/c bake)' if editing_goal else 'Goal locked')
+                print('Editing top (WASD/arrows move it over bottom)' if mode == 'edit_top' else 'Back to jog mode')
+            elif key == ord('h'):
+                mode = 'jog' if mode == 'edit_bottom' else 'edit_bottom'
+                if mode != 'jog':
+                    arm.stop_xyz()
+                print("Editing bottom (WASD/arrows adjust its SIFT-registered position)" if mode == 'edit_bottom' else 'Back to jog mode')
             elif key == ord('m'):
                 ref_pos = arm.positions()
                 print('Reference position set:', ref_pos)
-            elif editing_goal:
-                if key in (13, ord('c')):
-                    goal_rgb = bake_goal(c['composite'])
-                    editing_goal = False
-                    print(f'Goal updated: offset=({c["off_x"]:+.0f}, {c["off_y"]:+.0f}) px.')
-                else:
-                    nudge_composer(c, key, args.step)
+            elif mode == 'edit_top':
+                nudge_xy(c, key, args.step, 'off_x', 'off_y')
+            elif mode == 'edit_bottom':
+                nudge_xy(c, key, args.step, 'bx', 'by')
             elif i >= 0:
                 if key == 123 or key == 97:   # a
                     print('Left')
