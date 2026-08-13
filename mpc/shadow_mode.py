@@ -9,17 +9,23 @@ starts out as wherever the stage was on connect, and can be reset to the current
 'm', so you aren't stuck comparing against the stage's start-up position. No robot moves are ever issued by
 this script beyond your own key presses.
 
-The 'Goal Composer' window stays open for the whole program (not just at startup), so you can change the
-goal at any time. OpenCV doesn't report which window is focused, so WASD/arrows can't be routed by "which
-window you clicked into" — instead press 'g' to toggle edit mode: while editing, WASD/arrows nudge the
-composer and stage jogging is suspended; ENTER/'c' bakes the new goal and returns to jogging.
+Everything lives in one window: the live camera feed, the goal composite (top.jpg over bottom.jpg,
+positioned/blended live), and a heatmap of |blur(current) - blur(goal)| — the same diff the ViT actually
+regresses on — side by side, with predicted vs. real displacement printed underneath. There's no separate
+blocking "confirm the goal" step; the goal starts out as whatever the composer's default offset/opacity is
+and can be repositioned at any time.
+
+WASD/arrows are shared between jogging the stage and nudging the goal composite, since OpenCV can't tell
+which panel you "clicked into" — press 'g' to switch between the two: while editing, WASD/arrows nudge the
+composite and stage jogging is suspended; ENTER/'c' bakes the composite into the goal used for prediction
+and switches back to jogging.
 
 Controls (identical to manual_control.py, except 'g'/'m'):
-    w/a/s/d — jog y+/x+/y-/x- (or, in goal-edit mode, nudge the composer overlay)
+    w/a/s/d — jog y+/x+/y-/x- (or, in goal-edit mode, nudge the goal composite)
     q/e     — jog z+/z-
     g       — toggle goal-edit mode
     m       — set the current motor position as the reference point for "Real (since start)"
-    ENTER/c — (goal-edit mode only) bake the composer's current offset/opacity into the goal
+    ENTER/c — (goal-edit mode only) bake the composite's current offset/opacity into the goal
     0       — save the current camera frame to images/capture_{x}_{y}_{z}.png
     p       — print current motor positions
     ESC     — stop all axes and quit
@@ -170,10 +176,10 @@ def pick_folder() -> Path:
     return folders[int(choice)]
 
 
-def init_composer(top_path: Path, bottom_path: Path) -> dict:
-    """Load top/bottom and open the 'Goal Composer' window (with its opacity trackbar). The window
-    and returned state stay alive for the whole program, so the goal can be re-baked at any time —
-    see render_composer()/nudge_composer()/bake_goal()."""
+def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
+    """Load top/bottom and attach an 'opacity' trackbar to the (already-created) unified window.
+    The returned state stays alive for the whole program, so the goal can be re-baked at any time —
+    see update_composite()/nudge_composer()/bake_goal()."""
     top_full    = cv2.imread(str(top_path))
     bottom_full = cv2.imread(str(bottom_path))
     if top_full is None:
@@ -182,38 +188,25 @@ def init_composer(top_path: Path, bottom_path: Path) -> dict:
         raise FileNotFoundError(f'Could not read image: {bottom_path}')
 
     h, w = bottom_full.shape[:2]
-    preview_w = min(w, 1280)
-    preview_h = int(round(h * preview_w / w))
-
-    win = 'Goal Composer'
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, preview_w, preview_h)
     cv2.createTrackbar('opacity', win, int(round(TOP_OPACITY * 1000)), 1000, lambda _pos: None)
 
     return {
         'win': win, 'top_path': top_path, 'bottom_path': bottom_path,
         'top_full': top_full, 'bottom_full': bottom_full,
-        'h': h, 'w': w, 'preview_w': preview_w, 'preview_h': preview_h,
+        'h': h, 'w': w,
         'off_x': 0.0, 'off_y': 0.0, 'composite': bottom_full.copy(),
     }
 
 
-def render_composer(c: dict, editing: bool) -> np.ndarray:
-    """Recompute the composite from c's current offset + the opacity trackbar and redraw the
-    composer window. Returns the full-resolution BGR composite (bake_goal() turns it into a goal)."""
+def update_composite(c: dict) -> np.ndarray:
+    """Recompute c['composite'] from its current offset + the opacity trackbar. Returns the
+    full-resolution BGR composite (bake_goal() turns it into a goal)."""
     opacity = cv2.getTrackbarPos('opacity', c['win']) / 1000.0
     M = np.array([[1.0, 0.0, c['off_x']], [0.0, 1.0, c['off_y']]], dtype=np.float32)
     warped_top = cv2.warpAffine(c['top_full'], M, (c['w'], c['h']))
     composite = cv2.addWeighted(warped_top, opacity, c['bottom_full'], 1.0 - opacity, 0.0)
     c['composite'] = composite
-
-    display = cv2.resize(composite, (c['preview_w'], c['preview_h']), interpolation=cv2.INTER_AREA)
-    display = label(display, [
-        f"{c['top_path'].name} over {c['bottom_path'].name}",
-        f'offset: ({c["off_x"]:+.0f}, {c["off_y"]:+.0f}) px   opacity: {opacity:.2f}',
-        "EDITING - WASD/arrows nudge, ENTER/'c' bake, g to lock" if editing else "locked - press g to edit",
-    ])
-    cv2.imshow(c['win'], display)
+    c['opacity'] = opacity
     return composite
 
 
@@ -231,6 +224,53 @@ def nudge_composer(c: dict, key: int, step: int) -> None:
 def bake_goal(composite: np.ndarray) -> np.ndarray:
     goal_bgr = cv2.resize(composite, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
     return cv2.cvtColor(goal_bgr, cv2.COLOR_BGR2RGB)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Diff-mag visualization + unified layout
+# ─────────────────────────────────────────────────────────────────────────────
+
+def diff_mag_image(cur_rgb: np.ndarray, goal_rgb: np.ndarray) -> np.ndarray:
+    """|blur(cur) - blur(goal)| — the same blurred diff the ViT regresses on — as an IMG_SIZE x
+    IMG_SIZE BGR heatmap (cv2 GaussianBlur stand-in for the torch depthwise-conv blur used at
+    inference time, since this is for display only)."""
+    cur  = cv2.resize(cur_rgb,  (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    goal = cv2.resize(goal_rgb, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    k = 2 * max(1, int(round(3 * BLUR_SIGMA))) + 1
+    cur_b  = cv2.GaussianBlur(cur,  (k, k), BLUR_SIGMA)
+    goal_b = cv2.GaussianBlur(goal, (k, k), BLUR_SIGMA)
+    mag = np.mean(np.abs(cur_b - goal_b), axis=2)
+    mag_u8 = np.clip(mag * 255.0, 0, 255).astype(np.uint8)
+    return cv2.applyColorMap(mag_u8, cv2.COLORMAP_JET)
+
+
+def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarray,
+                 editing: bool, pred: np.ndarray, real: dict, c: dict) -> np.ndarray:
+    """Combine the live feed, goal composite, and diff-mag heatmap into one canvas, with a status
+    strip (mode + predicted/real displacement) underneath."""
+    panel_h = 420
+
+    def fit(img):
+        ih, iw = img.shape[:2]
+        w = max(1, int(round(iw * panel_h / ih)))
+        return cv2.resize(img, (w, panel_h), interpolation=cv2.INTER_AREA)
+
+    live_p = label(fit(live_bgr), ['LIVE'])
+    goal_p = label(fit(goal_bgr), ['GOAL', f'offset=({c["off_x"]:+.0f},{c["off_y"]:+.0f}) op={c.get("opacity", 0.0):.2f}'])
+    diff_p = label(fit(diff_bgr), ['DIFF MAG |cur-goal|'])
+
+    top = np.hstack([live_p, goal_p, diff_p])
+
+    status = np.zeros((70, top.shape[1], 3), dtype=np.uint8)
+    mode_line = ("EDITING GOAL - WASD/arrows nudge, ENTER/'c' bake, g to lock" if editing else
+                 "JOG MODE - w/a/s/d/q/e move stage, g to edit goal, m to set reference")
+    status = label(status, [
+        mode_line,
+        f'Predicted (cur->goal): dx={pred[0]:+.4f}mm dy={pred[1]:+.4f}mm  dcx={pred[2]:+.2f}px dcy={pred[3]:+.2f}px darea={pred[4]:+.2f}px2',
+        f'Real (since ref, m to reset): dx={real["x"]:+.4f}mm dy={real["y"]:+.4f}mm dz={real["z"]:+.4f}mm',
+    ])
+
+    return np.vstack([top, status])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,30 +311,21 @@ def main():
     delta_mean, delta_std = load_checkpoint(Path(args.ckpt), vit, head, device)
     blur_kernel = make_gaussian_kernel(BLUR_SIGMA, device)
 
-    # ── goal composer — stays open for the whole program, not just at startup ───
-    c = init_composer(Path(args.top), Path(args.bottom))
-    print(f'Positioning {c["top_path"].name} over {c["bottom_path"].name}.')
-    print("WASD/arrows nudge top, 'opacity' trackbar blends it, ENTER/'c' confirms the initial goal, ESC cancels.")
-    while True:
-        render_composer(c, editing=True)
-        key = cv2.waitKey(20) & 0xFF
-        if key == 27:                                        # ESC
-            cv2.destroyAllWindows()
-            raise SystemExit('Cancelled goal composition.')
-        elif key in (13, ord('c')):                          # ENTER / c
-            break
-        else:
-            nudge_composer(c, key, args.step)
-    goal_rgb = bake_goal(c['composite'])
-    print(f'Goal composed: offset=({c["off_x"]:+.0f}, {c["off_y"]:+.0f}) px -> {IMG_SIZE}x{IMG_SIZE} goal frame.')
+    # ── unified window — live feed, goal composite, and diff-mag heatmap all live here ──────────
+    WIN = 'Shadow Mode'
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN, 1600, 500)
+
+    c = init_composer(Path(args.top), Path(args.bottom), WIN)
+    goal_rgb = bake_goal(update_composite(c))
+    print(f'Positioning {c["top_path"].name} over {c["bottom_path"].name} — starting goal: '
+          f'offset=({c["off_x"]:+.0f}, {c["off_y"]:+.0f}) px. Press g to edit it at any time.')
 
     cam = None
     arm = None
     try:
         cam = CameraController(index=0, fps=15)
         cam.start()
-        cv2.namedWindow('Shadow Mode', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Shadow Mode', 960, 540)
 
         arm = TransferControl(only_xyz=True)
         ref_pos = arm.positions()
@@ -311,13 +342,10 @@ def main():
             cur_pos = arm.positions()
             real = {axis: cur_pos[axis] - ref_pos[axis] for axis in ('x', 'y', 'z')}
 
-            preview = cv2.resize(frame_bgr, (960, 540), interpolation=cv2.INTER_AREA)
-            display = label(preview, [
-                f'Predicted (cur->goal): dx={pred[0]:+.4f}mm dy={pred[1]:+.4f}mm  dcx={pred[2]:+.2f}px dcy={pred[3]:+.2f}px darea={pred[4]:+.2f}px2',
-                f'Real (since ref, m to reset): dx={real["x"]:+.4f}mm dy={real["y"]:+.4f}mm dz={real["z"]:+.4f}mm',
-            ])
-            cv2.imshow('Shadow Mode', display)
-            render_composer(c, editing=editing_goal)
+            composite = update_composite(c)
+            diff_img  = diff_mag_image(frame_rgb, goal_rgb)
+            canvas    = compose_view(frame_bgr, composite, diff_img, editing_goal, pred, real, c)
+            cv2.imshow(WIN, canvas)
 
             key = cv2.waitKey(1)
 
