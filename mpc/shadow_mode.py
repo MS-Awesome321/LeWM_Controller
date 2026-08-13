@@ -188,7 +188,7 @@ def init_composer(top_path: Path, bottom_path: Path) -> dict:
     win = 'Goal Composer'
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, preview_w, preview_h)
-    cv2.createTrackbar('opacity', win, int(round(TOP_OPACITY * 100)), 100, lambda _pos: None)
+    cv2.createTrackbar('opacity', win, int(round(TOP_OPACITY * 1000)), 1000, lambda _pos: None)
 
     return {
         'win': win, 'top_path': top_path, 'bottom_path': bottom_path,
@@ -201,7 +201,7 @@ def init_composer(top_path: Path, bottom_path: Path) -> dict:
 def render_composer(c: dict, editing: bool) -> np.ndarray:
     """Recompute the composite from c's current offset + the opacity trackbar and redraw the
     composer window. Returns the full-resolution BGR composite (bake_goal() turns it into a goal)."""
-    opacity = cv2.getTrackbarPos('opacity', c['win']) / 100.0
+    opacity = cv2.getTrackbarPos('opacity', c['win']) / 1000.0
     M = np.array([[1.0, 0.0, c['off_x']], [0.0, 1.0, c['off_y']]], dtype=np.float32)
     warped_top = cv2.warpAffine(c['top_full'], M, (c['w'], c['h']))
     composite = cv2.addWeighted(warped_top, opacity, c['bottom_full'], 1.0 - opacity, 0.0)
