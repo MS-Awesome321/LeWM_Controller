@@ -53,7 +53,7 @@ EMB_DIM     = 192
 BLUR_SIGMA  = 2.0    # must match diff_pred_20x.ipynb training
 TOP_OPACITY = 0.2    # diff_pred_20x.ipynb's default synthetic-composite opacity — initial trackbar value only
 
-DEBOUNCE = 5   # loop iterations to skip after a jog key press (same scheme as manual_control.py)
+DEBOUNCE = 15   # loop iterations to skip after a jog key press (same scheme as manual_control.py)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -375,6 +375,8 @@ def main():
                     print(arm.positions())
                 else:
                     arm.stop_xyz()
+            elif i >= -2*DEBOUNCE//3:
+                arm.stop_xyz()
 
             i += 1
 
