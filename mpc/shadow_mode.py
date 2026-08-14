@@ -1,7 +1,7 @@
 """
 Shadow mode: manually jog the stage (same controls as manual_control.py) while the diff_pred_20x ViT
 continuously watches the live camera feed and predicts the displacement to a goal frame composed from
---top over --bottom (WASD/arrows + opacity trackbar, same as diff_20_mpc.py), with --bottom SIFT-registered
+--top over --bottom (WASD/arrows + a draggable opacity slider), with --bottom SIFT-registered
 onto the live camera's coordinate frame (same registration pattern as flake_designer.py) so the goal is
 always expressed in the camera's own field of view. The predicted displacement is shown on screen next to
 the "real" displacement — the actual mm moved since a reference motor position, read straight from the
@@ -59,9 +59,14 @@ IMG_SIZE    = 224   # ViT input resolution — matches diff_pred_20x.ipynb
 PATCH_SIZE  = 16
 EMB_DIM     = 192
 BLUR_SIGMA  = 2.0    # must match diff_pred_20x.ipynb training
-TOP_OPACITY = 0.2    # diff_pred_20x.ipynb's default synthetic-composite opacity — initial trackbar value only
+TOP_OPACITY = 0.2    # diff_pred_20x.ipynb's default synthetic-composite opacity — initial slider value only
+MAX_CLIP    = 60     # diff-mag display clip (0-255 scale) — matches diff_pred_20x.ipynb's demo-cell visualization clip; display only, never applied to the ViT's actual input
 
 DEBOUNCE = 15   # loop iterations to skip after a jog key press (same scheme as manual_control.py)
+
+PANEL_H       = 420   # height of each of the LIVE/GOAL/DIFF panels
+SLIDER_H      = 30    # height of the custom opacity-slider strip drawn between the panels and the status strip
+SLIDER_MARGIN = 10    # left/right margin (px) of the draggable track within the slider strip
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,8 +205,10 @@ def pick_folder() -> Path:
 
 
 def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
-    """Load top/bottom and attach an 'opacity' trackbar to the (already-created) unified window.
-    The returned state stays alive for the whole program and is recomputed every frame — see
+    """Load top/bottom. Opacity is driven by a custom mouse-dragged slider (see draw_opacity_slider()/
+    opacity_mouse_callback()) rather than cv2.createTrackbar, since native OS trackbars snap to a small
+    number of discrete positions regardless of the `count` passed to createTrackbar. The returned state
+    stays alive for the whole program and is recomputed every frame — see
     update_composite()/nudge_xy()/warp_goal_to_live()/bake_goal()."""
     top_full    = cv2.imread(str(top_path))
     bottom_full = cv2.imread(str(bottom_path))
@@ -211,7 +218,6 @@ def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
         raise FileNotFoundError(f'Could not read image: {bottom_path}')
 
     h, w = bottom_full.shape[:2]
-    cv2.createTrackbar('opacity', win, int(round(TOP_OPACITY * 1000)), 1000, lambda _pos: None)
 
     return {
         'win': win, 'top_path': top_path, 'bottom_path': bottom_path,
@@ -219,13 +225,14 @@ def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
         'h': h, 'w': w,
         'off_x': 0.0, 'off_y': 0.0, 'composite': bottom_full.copy(),
         'bx': 0.0, 'by': 0.0,   # manual offset of --bottom on top of its SIFT-registered position
+        'opacity': TOP_OPACITY,   # continuous [0, 1] float, dragged via the custom slider
     }
 
 
 def update_composite(c: dict) -> np.ndarray:
-    """Recompute c['composite'] from its current offset + the opacity trackbar. Returns the
-    full-resolution BGR composite (bake_goal() turns it into a goal)."""
-    opacity = cv2.getTrackbarPos('opacity', c['win']) / 1000.0
+    """Recompute c['composite'] from its current offset + opacity. Returns the full-resolution BGR
+    composite (bake_goal() turns it into a goal)."""
+    opacity = c['opacity']
     M = np.array([[1.0, 0.0, c['off_x']], [0.0, 1.0, c['off_y']]], dtype=np.float32)
     warped_top = cv2.warpAffine(c['top_full'], M, (c['w'], c['h']))
     composite = cv2.addWeighted(warped_top, opacity, c['bottom_full'], 1.0 - opacity, 0.0)
@@ -270,27 +277,58 @@ def bake_goal(warped_goal: np.ndarray) -> np.ndarray:
 def diff_mag_image(cur_rgb: np.ndarray, goal_rgb: np.ndarray) -> np.ndarray:
     """|blur(cur) - blur(goal)| — the same blurred diff the ViT regresses on — as an IMG_SIZE x
     IMG_SIZE BGR heatmap (cv2 GaussianBlur stand-in for the torch depthwise-conv blur used at
-    inference time, since this is for display only)."""
+    inference time, since this is for display only). Clipped to MAX_CLIP (0-255 scale) before
+    colormapping, matching diff_pred_20x.ipynb's demo-cell visualization — the ViT's actual input
+    (predict_displacement()'s diff tensor) is never clipped, matching the notebook's real
+    extract_embedding() path."""
     cur  = cv2.resize(cur_rgb,  (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     goal = cv2.resize(goal_rgb, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     k = 2 * max(1, int(round(3 * BLUR_SIGMA))) + 1
     cur_b  = cv2.GaussianBlur(cur,  (k, k), BLUR_SIGMA)
     goal_b = cv2.GaussianBlur(goal, (k, k), BLUR_SIGMA)
-    mag = np.mean(np.abs(cur_b - goal_b), axis=2)
-    mag_u8 = np.clip(mag * 255.0, 0, 255).astype(np.uint8)
+    mag_255 = np.mean(np.abs(cur_b - goal_b), axis=2) * 255.0
+    mag_clipped = np.clip(mag_255, 0, MAX_CLIP)
+    mag_u8 = (mag_clipped / MAX_CLIP * 255.0).astype(np.uint8)
     return cv2.applyColorMap(mag_u8, cv2.COLORMAP_JET)
+
+
+def draw_opacity_slider(width: int, opacity: float) -> np.ndarray:
+    """Custom continuous opacity slider (replaces cv2.createTrackbar — see init_composer()),
+    drawn as a SLIDER_H x width strip with a filled track and a handle at `opacity`'s position.
+    opacity_mouse_callback() maps mouse x back to a [0, 1] float using the same SLIDER_MARGIN."""
+    strip = np.full((SLIDER_H, width, 3), 40, dtype=np.uint8)
+    usable = max(1, width - 2 * SLIDER_MARGIN)
+    track_y = SLIDER_H // 2
+    cv2.line(strip, (SLIDER_MARGIN, track_y), (width - SLIDER_MARGIN, track_y), (100, 100, 100), 2, cv2.LINE_AA)
+    handle_x = SLIDER_MARGIN + int(round(opacity * usable))
+    cv2.line(strip, (SLIDER_MARGIN, track_y), (handle_x, track_y), (0, 200, 0), 2, cv2.LINE_AA)
+    cv2.circle(strip, (handle_x, track_y), 7, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.putText(strip, f'opacity: {opacity:.3f}  (drag)', (SLIDER_MARGIN, SLIDER_H - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
+    return strip
+
+
+def opacity_mouse_callback(event, x, y, flags, c: dict) -> None:
+    """Registered once via cv2.setMouseCallback(WIN, opacity_mouse_callback, c). Dragging (left button
+    down or held) within the slider strip sets c['opacity'] continuously — see draw_opacity_slider()
+    for the matching layout/geometry."""
+    if not (0 <= y - c['slider_y0'] < SLIDER_H):
+        return
+    if event == cv2.EVENT_LBUTTONDOWN or (flags & cv2.EVENT_FLAG_LBUTTON):
+        usable = max(1, c['canvas_w'] - 2 * SLIDER_MARGIN)
+        frac = (x - SLIDER_MARGIN) / usable
+        c['opacity'] = float(np.clip(frac, 0.0, 1.0))
 
 
 def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarray,
                  mode: str, pred: np.ndarray, real: dict, c: dict) -> np.ndarray:
-    """Combine the live feed, SIFT-warped goal, and diff-mag heatmap into one canvas, with a status
-    strip (mode + predicted/real displacement) underneath."""
-    panel_h = 420
+    """Combine the live feed, SIFT-warped goal, and diff-mag heatmap into one canvas, with a custom
+    opacity-slider strip and a status strip (mode + predicted/real displacement) underneath."""
 
     def fit(img):
         ih, iw = img.shape[:2]
-        w = max(1, int(round(iw * panel_h / ih)))
-        return cv2.resize(img, (w, panel_h), interpolation=cv2.INTER_AREA)
+        w = max(1, int(round(iw * PANEL_H / ih)))
+        return cv2.resize(img, (w, PANEL_H), interpolation=cv2.INTER_AREA)
 
     live_p = label(fit(live_bgr), ['LIVE'])
     goal_p = label(fit(goal_bgr), [
@@ -301,6 +339,11 @@ def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarra
     diff_p = label(fit(diff_bgr), ['DIFF MAG |cur-goal|'])
 
     top = np.hstack([live_p, goal_p, diff_p])
+
+    # opacity_mouse_callback() reads these back to know where the slider strip is in canvas coords
+    c['canvas_w']  = top.shape[1]
+    c['slider_y0'] = PANEL_H
+    slider = draw_opacity_slider(top.shape[1], c.get('opacity', TOP_OPACITY))
 
     status = np.zeros((70, top.shape[1], 3), dtype=np.uint8)
     mode_line = {
@@ -314,7 +357,7 @@ def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarra
         f'Real (since ref, m to reset): dx={real["x"]:+.4f}mm dy={real["y"]:+.4f}mm dz={real["z"]:+.4f}mm',
     ])
 
-    return np.vstack([top, status])
+    return np.vstack([top, slider, status])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -362,6 +405,8 @@ def main():
     cv2.resizeWindow(WIN, 1600, 500)
 
     c = init_composer(Path(args.top), Path(args.bottom), WIN)
+    c['canvas_w'], c['slider_y0'] = 1, 0   # placeholder — compose_view() fills these in before the slider can be dragged
+    cv2.setMouseCallback(WIN, opacity_mouse_callback, c)
     print(f'Positioning {c["top_path"].name} over {c["bottom_path"].name}. Press g to move top, h to move bottom.')
 
     cam = None
