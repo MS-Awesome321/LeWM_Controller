@@ -1,4 +1,6 @@
+import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -9,9 +11,24 @@ import cv2
 
 ACTION_SCALE = 0.1
 DEBOUNCE = 20
+CAM_FPS = 15
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description='Manually jog the stage while viewing the live camera feed.')
+    p.add_argument('--save', nargs='?', const='', default=None,
+                    help='Save every captured frame to a video file in the current directory '
+                         '(default filename: manual_control_<timestamp>.mp4)')
+    return p.parse_args()
+
+
+args = parse_args()
+
+video_writer = None
+save_path = (args.save or f"manual_control_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4") if args.save is not None else None
 
 try:
-    cam = CameraController(index=0, fps=15)
+    cam = CameraController(index=0, fps=CAM_FPS)
     cam.start()
     cv2.namedWindow('Manual Transfer Control', cv2.WINDOW_NORMAL)
     cv2.resizeWindow('Manual Transfer Control', 960, 540)
@@ -25,6 +42,14 @@ try:
     i = 0
     while True:
         frame  = cam.snap()
+
+        if save_path is not None and video_writer is None:
+            h, w = frame.shape[:2]
+            video_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), CAM_FPS, (w, h))
+            print(f'Saving captured frames to {save_path}')
+        if video_writer is not None:
+            video_writer.write(frame)
+
         cv2.imshow('Manual Transfer Control', frame)
 
         key = cv2.waitKey(1)
@@ -75,4 +100,7 @@ except KeyboardInterrupt:
 finally:
     cam.stop()
     arm.disconnect()
+    if video_writer is not None:
+        video_writer.release()
+        print(f'Saved video to {save_path}')
     cv2.destroyAllWindows()
