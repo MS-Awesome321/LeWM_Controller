@@ -34,6 +34,8 @@ Controls:
     WASD / arrow keys                              — nudge --top in Window 1 (also repositions it in Window 2)
     'frame' trackbar (Window 2)                    — scrub through --video
     'top' / 'bottom' / 'video opacity' (Window 2)   — normalized (sum-to-1) blend weights for each layer in Window 2
+    1 / 2 / 3                                       — select top / bottom / video as the target of +/- blur control
+    + / -                                            — increase/decrease the selected layer's Gaussian blur sigma by 0.05 (Window 2's composite/diff)
     'frame' trackbar (Window 4, Subtractor)         — pick the frame subtracted in Window 3
     --frame-num                                     — video frame index used for the SIFT fit (set once at startup, not a trackbar)
     ESC (any window)                                — quit
@@ -77,6 +79,22 @@ def label(img: np.ndarray, lines: list[str]) -> np.ndarray:
     return out
 
 
+def upscale_if_10x(img: np.ndarray, path: str) -> np.ndarray:
+    """10x-scale stills are half the magnification of a 20x video/design, so upscale them 2x to match."""
+    if '10x' in Path(path).name.lower():
+        return cv2.resize(img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    return img
+
+
+def blur_img(img: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian-blur img by sigma (no-op if sigma <= 0) — used for the per-layer top/bottom/video
+    blur control in Window 2 (keys 1/2/3 select the layer, +/- adjust its sigma)."""
+    if sigma <= 0:
+        return img
+    k = 2 * max(1, int(round(3 * sigma))) + 1
+    return cv2.GaussianBlur(img, (k, k), sigma)
+
+
 def sift_affine(small_gray: np.ndarray, large_gray: np.ndarray, ratio_thresh: float) -> np.ndarray:
     """SIFT + ratio-test + RANSAC-affine pipeline (same as sift_align.py)."""
     sift = cv2.SIFT_create()
@@ -109,6 +127,8 @@ def main():
         raise FileNotFoundError(f'Could not read image: {args.top}')
     if bottom_full is None:
         raise FileNotFoundError(f'Could not read image: {args.bottom}')
+    top_full = upscale_if_10x(top_full, args.top)
+    bottom_full = upscale_if_10x(bottom_full, args.bottom)
 
     video_path = Path(args.video) if args.video else Path(args.bottom).parent / '5x.mp4'
     cap = cv2.VideoCapture(str(video_path))
@@ -181,17 +201,23 @@ def main():
 
     out_size = target_size(vw, vh)
 
+    blur_sigma = {'top': 0.0, 'bottom': 0.0, 'video': 0.0}
+    blur_target = 'top'   # selected by keys 1/2/3; +/- adjust blur_sigma[blur_target]
+
     while True:
         opacity = cv2.getTrackbarPos('opacity', win1) / 100.0
 
         # --- Window 1: manual overlay ---
         M1 = np.array([[1, 0, off_x], [0, 1, off_y]], dtype=np.float32)
         warped1 = cv2.warpAffine(img1_disp, M1, (w2, h2))
-        overlay1 = cv2.addWeighted(warped1, opacity, img2_disp, 1.0 - opacity, 0.0)
+        warped1_b = blur_img(warped1, blur_sigma['top'])
+        img2_disp_b = blur_img(img2_disp, blur_sigma['bottom'])
+        overlay1 = cv2.addWeighted(warped1_b, opacity, img2_disp_b, 1.0 - opacity, 0.0)
         display1 = label(overlay1, [
             f'{Path(args.top).name} over {Path(args.bottom).name}',
             f'displacement: ({off_x - start_x:+d}, {off_y - start_y:+d}) px',
             f'opacity: {opacity:.2f}',
+            f'blur (1/2/3 select, +/- adjust)  top={blur_sigma["top"]:.2f} bottom={blur_sigma["bottom"]:.2f} video={blur_sigma["video"]:.2f}  [selected: {blur_target}]',
         ])
         cv2.imshow(win1, display1)
 
@@ -220,18 +246,24 @@ def main():
         else:
             w_top = w_bottom = w_video = 0.0
 
-        overlay2 = (w_top * warped_top.astype(np.float32)
-                    + w_bottom * warped_bottom.astype(np.float32)
-                    + w_video * frame.astype(np.float32))
-        overlay2 = np.clip(overlay2, 0, 255).astype(np.uint8)
+        # per-layer blur control (keys 1/2/3 select the layer, +/- adjust its sigma) — resize down to
+        # display resolution *before* blurring (like Window 1/4) so a given sigma reads the same way in
+        # every window, instead of getting washed out by the ~8x display downsample that follows it
+        warped_top_disp = blur_img(cv2.resize(warped_top, out_size, interpolation=cv2.INTER_AREA), blur_sigma['top'])
+        warped_bottom_disp = blur_img(cv2.resize(warped_bottom, out_size, interpolation=cv2.INTER_AREA), blur_sigma['bottom'])
+        frame_disp = blur_img(cv2.resize(frame, out_size, interpolation=cv2.INTER_AREA), blur_sigma['video'])
 
-        overlay2_disp = cv2.resize(overlay2, out_size)
+        overlay2_disp = (w_top * warped_top_disp.astype(np.float32)
+                         + w_bottom * warped_bottom_disp.astype(np.float32)
+                         + w_video * frame_disp.astype(np.float32))
+        overlay2_disp = np.clip(overlay2_disp, 0, 255).astype(np.uint8)
 
         display2 = label(overlay2_disp, [
             f'frame {frame_idx}/{n_frames - 1}',
             f'bottom: {Path(args.bottom).name}  top: {Path(args.top).name}  ({out_size[0]}x{out_size[1]})',
             f'opacity  top={top_opacity:.2f} bottom={bottom_opacity:.2f} video={video_opacity:.2f}',
             f'weight   top={w_top:.2f} bottom={w_bottom:.2f} video={w_video:.2f}',
+            f'blur (1/2/3 select, +/- adjust)  top={blur_sigma["top"]:.2f} bottom={blur_sigma["bottom"]:.2f} video={blur_sigma["video"]:.2f}  [selected: {blur_target}]',
         ])
         cv2.imshow(win2, display2)
 
@@ -241,8 +273,11 @@ def main():
         ok_sub, frame_sub = cap.read()
         if not ok_sub:
             frame_sub = np.zeros((vh, vw, 3), dtype=np.uint8)
-        frame_sub_disp = cv2.resize(frame_sub, out_size)
-        display4 = label(frame_sub_disp, [f'frame {sub_frame_idx}/{n_frames - 1}'])
+        frame_sub_disp = blur_img(cv2.resize(frame_sub, out_size), blur_sigma['video'])
+        display4 = label(frame_sub_disp, [
+            f'frame {sub_frame_idx}/{n_frames - 1}',
+            f'blur (3 select, +/- adjust)  video={blur_sigma["video"]:.2f}',
+        ])
         cv2.imshow(win4, display4)
 
         # --- Window 3: diff magnitude between Window 2's overlay (top+bottom on frame) and Window 4's (Subtractor) ---
@@ -263,6 +298,16 @@ def main():
             off_y += args.step
         elif key in (ord('w'), 82):                           # up / w
             off_y -= args.step
+        elif key == ord('1'):
+            blur_target = 'top'
+        elif key == ord('2'):
+            blur_target = 'bottom'
+        elif key == ord('3'):
+            blur_target = 'video'
+        elif key in (ord('+'), ord('=')):
+            blur_sigma[blur_target] += 0.05
+        elif key == ord('-'):
+            blur_sigma[blur_target] = max(0.0, blur_sigma[blur_target] - 0.05)
 
     cap.release()
     cv2.destroyAllWindows()
