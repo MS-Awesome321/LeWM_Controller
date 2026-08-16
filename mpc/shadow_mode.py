@@ -76,19 +76,18 @@ TOP_OPACITY = 0.2    # diff_pred_20x.ipynb's default synthetic-composite opacity
 MAX_CLIP    = 60     # diff-mag display clip (0-255 scale) — matches diff_pred_20x.ipynb's demo-cell visualization clip; display only, never applied to the ViT's actual input
 DIFF_SUBTRACT_STEP = 1.0   # per-press change (0-255 scale) to the live-adjustable diff offset, '='/'-' keys — see main()
 
-# diff_pred_robust.ipynb resizes raw 10x-magnification stills to (BOTTOM_RESIZE_W, BOTTOM_RESIZE_H)
-# before center-cropping to IMG_SIZE, simulating the ~2x zoom needed to match a 20x FOV. Here we only
-# need the inverse of the crop fraction that recipe implies (BOTTOM_RESIZE_W/IMG_SIZE,
-# BOTTOM_RESIZE_H/IMG_SIZE): the live video feed is captured at 20x while --top/--bottom are raw 10x
-# stills, so those stills are upsampled by that factor (see _zoom_10x_to_20x()) — no cropping yet —
-# to match the live feed's pixel density before SIFT registration. Order after that: SIFT align ->
-# overlay (update_composite) -> crop down to the live view's actual frame (warp_goal_to_live(), via
-# its SIFT-positioned warpAffine into (live_w, live_h)) -> resize to IMG_SIZE, only once, in
-# bake_goal(), right before the ViT sees it. Zoom only applied when the image filename contains
-# "10x" — pre-made design assets (e.g. the old top.jpg/bottom.jpg) are already at the intended scale
-# and are left untouched.
-BOTTOM_RESIZE_W = 448
-BOTTOM_RESIZE_H = 488
+# 20x is exactly 2x more magnified than 10x, so raw 10x stills are upsampled by this factor —
+# uniformly on both axes, since optical magnification doesn't distort aspect ratio — to match the
+# live 20x feed's pixel density before SIFT registration (see _zoom_10x_to_20x()); no cropping yet.
+# (Deliberately NOT derived from diff_pred_robust.ipynb's BOTTOM_RESIZE_W/BOTTOM_RESIZE_H (448/488):
+# that pair resizes to a fixed *canonical* size before a square center-crop for its own ViT input
+# pipeline, and 448/224=2.0 but 488/224≈2.179 — a non-uniform, aspect-distorting ratio that's wrong
+# for a physical zoom.) Order after upsampling: SIFT align -> overlay (update_composite) -> crop
+# down to the live view's actual frame (warp_goal_to_live(), via its SIFT-positioned warpAffine into
+# (live_w, live_h)) -> resize to IMG_SIZE, only once, in bake_goal(), right before the ViT sees it.
+# Zoom only applied when the image filename contains "10x" — pre-made design assets (e.g. the old
+# top.jpg/bottom.jpg) are already at the intended scale and are left untouched.
+ZOOM_10X_TO_20X = 2.0
 
 DEBOUNCE = 15   # loop iterations to skip after a jog key press (same scheme as manual_control.py)
 
@@ -256,14 +255,14 @@ def pick_folder() -> Path:
 
 def _zoom_10x_to_20x(img: np.ndarray) -> np.ndarray:
     """Digitally "zoom in" a raw 10x-magnification still to match the live feed's 20x pixel density,
-    by upsampling the WHOLE image (no cropping) by the inverse of the fraction
-    diff_pred_robust.ipynb's _cache_image() crops after its resize-to-(BOTTOM_RESIZE_W,
-    BOTTOM_RESIZE_H) step. No content is thrown away here — cropping down to the live view's actual
-    FOV happens later, after SIFT alignment and the top/bottom overlay (see warp_goal_to_live()), and
+    by upsampling the WHOLE image (no cropping) by ZOOM_10X_TO_20X, uniformly on both axes — a
+    physical magnification change doesn't distort aspect ratio, so width and height must scale by
+    the same factor. No content is thrown away here — cropping down to the live view's actual FOV
+    happens later, after SIFT alignment and the top/bottom overlay (see warp_goal_to_live()), and
     the only resize to IMG_SIZE happens after that, in bake_goal()."""
     nh, nw = img.shape[:2]
-    new_h = round(nh * BOTTOM_RESIZE_H / IMG_SIZE)
-    new_w = round(nw * BOTTOM_RESIZE_W / IMG_SIZE)
+    new_h = round(nh * ZOOM_10X_TO_20X)
+    new_w = round(nw * ZOOM_10X_TO_20X)
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
 
@@ -405,6 +404,21 @@ def draw_opacity_slider(width: int, opacity: float) -> np.ndarray:
     return strip
 
 
+def draw_colorbar(height: int, max_val: float, width: int = 60, bar_w: int = 20) -> np.ndarray:
+    """Vertical INFERNO colorbar (max_val at top, 0 at bottom) matching diff_mag_image()'s
+    colormap/clip exactly, so the diff heatmap's colors can be read off as 0-MAX_CLIP diff-magnitude
+    values — the same info a matplotlib fig.colorbar() gives in diff_pred_robust.ipynb's demo cells."""
+    ramp = np.linspace(255, 0, height, dtype=np.uint8).reshape(height, 1)
+    bar = cv2.applyColorMap(np.repeat(ramp, bar_w, axis=1), cv2.COLORMAP_INFERNO)
+    strip = np.full((height, width, 3), 40, dtype=np.uint8)
+    strip[:, :bar_w] = bar
+    for frac, val in ((0.0, max_val), (0.5, max_val / 2), (1.0, 0.0)):
+        y = int(round(frac * (height - 1)))
+        cv2.putText(strip, f'{val:.0f}', (bar_w + 4, min(max(y, 10), height - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+    return strip
+
+
 def opacity_mouse_callback(event, x, y, flags, c: dict) -> None:
     """Registered once via cv2.setMouseCallback(WIN, opacity_mouse_callback, c). Dragging (left button
     down or held) within the slider strip sets c['opacity'] continuously — see draw_opacity_slider()
@@ -419,10 +433,11 @@ def opacity_mouse_callback(event, x, y, flags, c: dict) -> None:
 
 def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarray, diff_label: str,
                  mode: str, pred_str: str, real: dict, c: dict) -> np.ndarray:
-    """Combine the live feed, SIFT-warped goal, and diff-mag heatmap into one canvas, with a custom
-    opacity-slider strip and a status strip (mode + predicted/real displacement) underneath.
-    pred_str/diff_label are pre-formatted by the caller since their content (which axes, blurred or
-    not) depends on which checkpoint (diff_pred_20x vs diff_pred_robust) is loaded."""
+    """Combine the live feed, SIFT-warped goal, diff-mag heatmap, and a colorbar (see draw_colorbar())
+    into one canvas, with a custom opacity-slider strip and a status strip (mode + predicted/real
+    displacement) underneath. pred_str/diff_label are pre-formatted by the caller since their content
+    (which axes, blurred or not) depends on which checkpoint (diff_pred_20x vs diff_pred_robust) is
+    loaded."""
 
     def fit(img):
         ih, iw = img.shape[:2]
@@ -436,8 +451,9 @@ def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarra
         f'bottom=({c["bx"]:+.0f},{c["by"]:+.0f})',
     ])
     diff_p = label(fit(diff_bgr), [diff_label])
+    colorbar = draw_colorbar(PANEL_H, MAX_CLIP)
 
-    top = np.hstack([live_p, goal_p, diff_p])
+    top = np.hstack([live_p, goal_p, diff_p, colorbar])
 
     # opacity_mouse_callback() reads these back to know where the slider strip is in canvas coords
     c['canvas_w']  = top.shape[1]
