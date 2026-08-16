@@ -29,12 +29,14 @@ which panel you "clicked into" — press 'g' to nudge --top's position over --bo
 --bottom's position (a manual offset on top of the one-time SIFT registration onto the live view); either
 one suspends stage jogging until you press it again to go back to jog mode.
 
-Controls (identical to manual_control.py, except 'g'/'h'/'m'):
+Controls (identical to manual_control.py, except 'g'/'h'/'m'/'='/'-'):
     w/a/s/d — jog y+/x+/y-/x- (or, in an edit mode, nudge the top/bottom position)
     q/e     — jog z+/z-
     g       — toggle "edit top" mode (WASD/arrows move --top over --bottom)
     h       — toggle "edit bottom" mode (WASD/arrows move --bottom's SIFT-registered position)
     m       — set the current motor position as the reference point for "Real (since start)"
+    =/-     — raise/lower the diff-subtract constant (see diff_mag_image()/predict_displacement()),
+              subtracted from the diff before it's shown and before the ViT sees it
     0       — save the current camera frame to images/capture_{x}_{y}_{z}.png
     p       — print current motor positions
     ESC     — stop all axes and quit
@@ -72,6 +74,7 @@ BLUR_SIGMA  = 2.0    # must match diff_pred_20x.ipynb training — only applied 
                       # ViT input preprocessing (see load_checkpoint()/predict_displacement())
 TOP_OPACITY = 0.2    # diff_pred_20x.ipynb's default synthetic-composite opacity — initial slider value only
 MAX_CLIP    = 60     # diff-mag display clip (0-255 scale) — matches diff_pred_20x.ipynb's demo-cell visualization clip; display only, never applied to the ViT's actual input
+DIFF_SUBTRACT_STEP = 1.0   # per-press change (0-255 scale) to the live-adjustable diff offset, '='/'-' keys — see main()
 
 # diff_pred_robust.ipynb resizes raw 10x-magnification stills to (BOTTOM_RESIZE_W, BOTTOM_RESIZE_H)
 # before center-cropping to IMG_SIZE, simulating the ~2x zoom needed to match a 20x FOV. Here we only
@@ -182,7 +185,7 @@ def to_float_frame(frame_rgb: np.ndarray, device: str) -> torch.Tensor:
 @torch.no_grad()
 def predict_displacement(cur_rgb: np.ndarray, goal_rgb: np.ndarray, vit, head,
                          blur_kernel, delta_mean: torch.Tensor, delta_std: torch.Tensor,
-                         device: str, goal_minus_cur: bool) -> np.ndarray:
+                         device: str, goal_minus_cur: bool, diff_subtract: float = 0.0) -> np.ndarray:
     """Predicted displacement (dims depend on the loaded checkpoint's target_dim — mm,mm for
     diff_pred_robust, or mm,mm,px,px,px² for diff_pred_20x) to move from cur -> goal.
 
@@ -190,11 +193,16 @@ def predict_displacement(cur_rgb: np.ndarray, goal_rgb: np.ndarray, vit, head,
     trained on diff = frame_j - frame_i with frame_i/frame_j playing the cur/goal roles
     respectively, i.e. diff = goal - cur (goal_minus_cur=True). Both checkpoints' targets represent
     the same "cur -> goal" displacement — only the diff's sign convention differs.
+
+    diff_subtract (0-255 scale, live-adjustable via '='/'-' in main()) is subtracted from every pixel
+    of the diff — before the ViT ever sees it — to compensate for a systematic brightness offset
+    between the live camera and the static top/bottom stills; 0 leaves the diff unchanged.
     """
     cur  = to_float_frame(cur_rgb, device)
     goal = to_float_frame(goal_rgb, device)
     cur_b, goal_b = gaussian_blur(cur, blur_kernel), gaussian_blur(goal, blur_kernel)
     diff = (goal_b - cur_b) if goal_minus_cur else (cur_b - goal_b)
+    diff = diff - diff_subtract / 255.0
     cls_token = vit(diff, interpolate_pos_encoding=False).last_hidden_state[:, 0]
     pred_norm = head(cls_token)
     pred_raw  = pred_norm * delta_std + delta_mean
@@ -351,25 +359,30 @@ def bake_goal(warped_goal: np.ndarray) -> np.ndarray:
 # Diff-mag visualization + unified layout
 # ─────────────────────────────────────────────────────────────────────────────
 
-def diff_mag_image(cur_rgb: np.ndarray, goal_rgb: np.ndarray, blur_sigma: float | None) -> np.ndarray:
+def diff_mag_image(cur_rgb: np.ndarray, goal_rgb: np.ndarray, blur_sigma: float | None,
+                   goal_minus_cur: bool, diff_subtract: float = 0.0) -> np.ndarray:
     """|blur(cur) - blur(goal)| (or the unblurred |cur - goal| when blur_sigma is None) — the same
     diff the ViT regresses on — as an IMG_SIZE x IMG_SIZE BGR heatmap (cv2 GaussianBlur stand-in for
     the torch depthwise-conv blur used at inference time, since this is for display only).
     blur_sigma should be None for diff_pred_robust checkpoints (no preprocessing blur — see
-    predict_displacement()) and BLUR_SIGMA for diff_pred_20x ones. Clipped to MAX_CLIP (0-255 scale)
-    before colormapping, matching diff_pred_20x.ipynb's demo-cell visualization — the ViT's actual
-    input (predict_displacement()'s diff tensor) is never clipped, matching the notebook's real
-    extract_embedding() path."""
+    predict_displacement()) and BLUR_SIGMA for diff_pred_20x ones. goal_minus_cur/diff_subtract
+    mirror predict_displacement()'s diff sign convention and live-adjustable offset exactly, so this
+    heatmap always shows what the ViT actually sees. Clipped to MAX_CLIP (0-255 scale) before
+    colormapping (matplotlib's 'inferno', matching diff_pred_robust.ipynb's demo-cell visualization)
+    — the ViT's actual input (predict_displacement()'s diff tensor) is never clipped, matching the
+    notebook's real extract_embedding() path."""
     cur  = cv2.resize(cur_rgb,  (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     goal = cv2.resize(goal_rgb, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     if blur_sigma:
         k = 2 * max(1, int(round(3 * blur_sigma))) + 1
         cur  = cv2.GaussianBlur(cur,  (k, k), blur_sigma)
         goal = cv2.GaussianBlur(goal, (k, k), blur_sigma)
-    mag_255 = np.mean(np.abs(cur - goal), axis=2) * 255.0
+    diff = (goal - cur) if goal_minus_cur else (cur - goal)
+    diff = diff - diff_subtract / 255.0
+    mag_255 = np.mean(np.abs(diff), axis=2) * 255.0
     mag_clipped = np.clip(mag_255, 0, MAX_CLIP)
     mag_u8 = (mag_clipped / MAX_CLIP * 255.0).astype(np.uint8)
-    return cv2.applyColorMap(mag_u8, cv2.COLORMAP_JET)
+    return cv2.applyColorMap(mag_u8, cv2.COLORMAP_INFERNO)
 
 
 def draw_opacity_slider(width: int, opacity: float) -> np.ndarray:
@@ -484,7 +497,8 @@ def main():
     vit, head = build_model(device, target_dim)
     delta_mean, delta_std = apply_checkpoint(ckpt, vit, head, device)
     blur_kernel = None if is_robust else make_gaussian_kernel(BLUR_SIGMA, device)
-    diff_label = 'DIFF MAG |cur-goal|' + (' (no blur)' if is_robust else f' (blur σ={BLUR_SIGMA})')
+    diff_order_label = '|goal-cur|' if is_robust else '|cur-goal|'
+    diff_label_base = f'DIFF MAG {diff_order_label}' + (' (no blur)' if is_robust else f' (blur σ={BLUR_SIGMA})')
     if is_robust:
         pred_fields = [('dx', 'mm', '+.4f'), ('dy', 'mm', '+.4f')]
     else:
@@ -521,6 +535,7 @@ def main():
 
         i = 0
         mode = 'jog'   # 'jog' | 'edit_top' | 'edit_bottom'
+        diff_subtract = 0.0   # live-adjustable (0-255 scale), '='/'-' — see predict_displacement()/diff_mag_image()
         while True:
             frame_bgr = cam.snap()
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -532,12 +547,14 @@ def main():
             goal_rgb    = bake_goal(warped_goal)
 
             pred = predict_displacement(frame_rgb, goal_rgb, vit, head, blur_kernel,
-                                        delta_mean, delta_std, device, is_robust)
+                                        delta_mean, delta_std, device, is_robust, diff_subtract)
             pred_str = '  '.join(f'{n}={pred[i]:{fmt}}{u}' for i, (n, u, fmt) in enumerate(pred_fields))
             cur_pos = arm.positions()
             real = {axis: cur_pos[axis] - ref_pos[axis] for axis in ('x', 'y', 'z')}
 
-            diff_img = diff_mag_image(frame_rgb, goal_rgb, None if is_robust else BLUR_SIGMA)
+            diff_img = diff_mag_image(frame_rgb, goal_rgb, None if is_robust else BLUR_SIGMA,
+                                      is_robust, diff_subtract)
+            diff_label = diff_label_base + f'  subtract={diff_subtract:+.1f}'
             canvas   = compose_view(frame_bgr, warped_goal, diff_img, diff_label, mode, pred_str, real, c)
             cv2.imshow(WIN, canvas)
 
@@ -561,6 +578,12 @@ def main():
             elif key == ord('m'):
                 ref_pos = arm.positions()
                 print('Reference position set:', ref_pos)
+            elif key == ord('='):
+                diff_subtract += DIFF_SUBTRACT_STEP
+                print(f'Diff subtract: {diff_subtract:+.1f}')
+            elif key == ord('-'):
+                diff_subtract -= DIFF_SUBTRACT_STEP
+                print(f'Diff subtract: {diff_subtract:+.1f}')
             elif mode == 'edit_top':
                 nudge_xy(c, key, args.step, 'off_x', 'off_y')
             elif mode == 'edit_bottom':
