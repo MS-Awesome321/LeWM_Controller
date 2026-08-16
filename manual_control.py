@@ -10,7 +10,7 @@ from hardware.transfer_control_controller import TransferControl
 import cv2
 
 ACTION_SCALE = 0.1
-DEBOUNCE = 20
+DEBOUNCE = 10
 CAM_FPS = 15
 
 
