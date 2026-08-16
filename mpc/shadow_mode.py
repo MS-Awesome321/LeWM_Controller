@@ -1,5 +1,5 @@
 """
-Shadow mode: manually jog the stage (same controls as manual_control.py) while the diff_pred_20x ViT
+Shadow mode: manually jog the stage (same controls as manual_control.py) while a diff_pred ViT
 continuously watches the live camera feed and predicts the displacement to a goal frame composed from
 --top over --bottom (WASD/arrows + a draggable opacity slider), with --bottom SIFT-registered
 onto the live camera's coordinate frame (same registration pattern as flake_designer.py) so the goal is
@@ -9,6 +9,13 @@ motor positions — so you can manually drive the stage and eyeball how well the
 real motion. The reference position starts out as wherever the stage was on connect, and can be reset to
 the current position at any time with 'm'. No robot moves are ever issued by this script beyond your own
 key presses.
+
+Works with either a diff_pred_20x checkpoint (target_dim=5: [Δx,Δy,Δcx,Δcy,Δarea], trained on
+diff = cur - goal with both frames Gaussian-blurred by BLUR_SIGMA before differencing) or a
+diff_pred_robust checkpoint (target_dim=2: [Δx,Δy], trained on diff = goal - cur with no
+preprocessing blur — blur is baked directly into the synthetic training composites instead).
+--ckpt's target_dim, blur behavior, and diff order are all auto-detected from the checkpoint file
+itself (see load_checkpoint()), so no extra flag is needed to switch between them.
 
 Everything lives in one window: the live camera feed, the goal (top+bottom, positioned live and SIFT-warped
 onto the live view's frame), and a heatmap of |blur(current) - blur(goal)| — the same diff the ViT actually
@@ -35,6 +42,7 @@ Controls (identical to manual_control.py, except 'g'/'h'/'m'):
 Usage:
     python mpc/shadow_mode.py                                 # prompts for a 20X_DropDown/<n> folder
     python mpc/shadow_mode.py --folder 20X_DropDown/2
+    python mpc/shadow_mode.py --ckpt checkpoints/diff_pred_20x_epoch_0099.pt
 """
 from __future__ import annotations
 
@@ -58,7 +66,10 @@ DATA_DIR    = REPO_ROOT / '20X_DropDown'
 IMG_SIZE    = 224   # ViT input resolution — matches diff_pred_20x.ipynb
 PATCH_SIZE  = 16
 EMB_DIM     = 192
-BLUR_SIGMA  = 2.0    # must match diff_pred_20x.ipynb training
+BLUR_SIGMA  = 2.0    # must match diff_pred_20x.ipynb training — only applied for target_dim=5
+                      # checkpoints; diff_pred_robust (target_dim=2) skips this entirely, since its
+                      # blur is baked into the synthetic composites at training time, not applied as
+                      # ViT input preprocessing (see load_checkpoint()/predict_displacement())
 TOP_OPACITY = 0.2    # diff_pred_20x.ipynb's default synthetic-composite opacity — initial slider value only
 MAX_CLIP    = 60     # diff-mag display clip (0-255 scale) — matches diff_pred_20x.ipynb's demo-cell visualization clip; display only, never applied to the ViT's actual input
 
@@ -74,7 +85,8 @@ SLIDER_MARGIN = 10    # left/right margin (px) of the draggable track within the
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DisplacementHead(nn.Module):
-    """CLS token -> small MLP -> (5,): [Δx, Δy, Δcx, Δcy, Δarea]."""
+    """CLS token -> small MLP -> (target_dim,): [Δx, Δy, Δcx, Δcy, Δarea] for diff_pred_20x
+    (target_dim=5), or [Δx, Δy] for diff_pred_robust (target_dim=2)."""
     def __init__(self, emb_dim=EMB_DIM, target_dim=5):
         super().__init__()
         self.net = nn.Sequential(
@@ -88,26 +100,34 @@ class DisplacementHead(nn.Module):
         return self.net(emb)
 
 
-def build_model(device: str):
+def build_model(device: str, target_dim: int = 5):
     vit_cfg = ViTConfig(
         num_channels=3, image_size=IMG_SIZE, patch_size=PATCH_SIZE,
         hidden_size=EMB_DIM, num_hidden_layers=6,
         num_attention_heads=3, intermediate_size=768,
     )
     vit  = ViTModel(vit_cfg, add_pooling_layer=False).to(device)
-    head = DisplacementHead(emb_dim=EMB_DIM).to(device)
+    head = DisplacementHead(emb_dim=EMB_DIM, target_dim=target_dim).to(device)
     vit.eval()
     head.eval()
     return vit, head
 
 
-def load_checkpoint(ckpt_path: Path, vit, head, device: str):
+def load_checkpoint(ckpt_path: Path, device: str):
+    """Loads the raw checkpoint dict and infers target_dim from the head's output layer shape
+    (5 -> diff_pred_20x, 2 -> diff_pred_robust), so the caller knows which model to build before
+    calling apply_checkpoint()."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    target_dim = ckpt['head']['net.3.weight'].shape[0]
+    print(f'Loaded checkpoint: {ckpt_path.name}  (epoch {ckpt.get("epoch", "?")}, target_dim={target_dim})')
+    return ckpt, target_dim
+
+
+def apply_checkpoint(ckpt: dict, vit, head, device: str):
     vit.load_state_dict(ckpt['vit'])
     head.load_state_dict(ckpt['head'])
     delta_mean = ckpt['delta_mean'].to(device)
     delta_std  = ckpt['delta_std'].to(device)
-    print(f'Loaded checkpoint: {ckpt_path.name}  (epoch {ckpt.get("epoch", "?")})')
     return delta_mean, delta_std
 
 
@@ -148,11 +168,19 @@ def to_float_frame(frame_rgb: np.ndarray, device: str) -> torch.Tensor:
 @torch.no_grad()
 def predict_displacement(cur_rgb: np.ndarray, goal_rgb: np.ndarray, vit, head,
                          blur_kernel, delta_mean: torch.Tensor, delta_std: torch.Tensor,
-                         device: str) -> np.ndarray:
-    """Predicted [Δx, Δy, Δcx, Δcy, Δarea] (mm, mm, px, px, px²) to move from cur → goal."""
+                         device: str, goal_minus_cur: bool) -> np.ndarray:
+    """Predicted displacement (dims depend on the loaded checkpoint's target_dim — mm,mm for
+    diff_pred_robust, or mm,mm,px,px,px² for diff_pred_20x) to move from cur -> goal.
+
+    diff_pred_20x was trained on diff = cur - goal (goal_minus_cur=False); diff_pred_robust was
+    trained on diff = frame_j - frame_i with frame_i/frame_j playing the cur/goal roles
+    respectively, i.e. diff = goal - cur (goal_minus_cur=True). Both checkpoints' targets represent
+    the same "cur -> goal" displacement — only the diff's sign convention differs.
+    """
     cur  = to_float_frame(cur_rgb, device)
     goal = to_float_frame(goal_rgb, device)
-    diff = gaussian_blur(cur, blur_kernel) - gaussian_blur(goal, blur_kernel)
+    cur_b, goal_b = gaussian_blur(cur, blur_kernel), gaussian_blur(goal, blur_kernel)
+    diff = (goal_b - cur_b) if goal_minus_cur else (cur_b - goal_b)
     cls_token = vit(diff, interpolate_pos_encoding=False).last_hidden_state[:, 0]
     pred_norm = head(cls_token)
     pred_raw  = pred_norm * delta_std + delta_mean
@@ -274,19 +302,22 @@ def bake_goal(warped_goal: np.ndarray) -> np.ndarray:
 # Diff-mag visualization + unified layout
 # ─────────────────────────────────────────────────────────────────────────────
 
-def diff_mag_image(cur_rgb: np.ndarray, goal_rgb: np.ndarray) -> np.ndarray:
-    """|blur(cur) - blur(goal)| — the same blurred diff the ViT regresses on — as an IMG_SIZE x
-    IMG_SIZE BGR heatmap (cv2 GaussianBlur stand-in for the torch depthwise-conv blur used at
-    inference time, since this is for display only). Clipped to MAX_CLIP (0-255 scale) before
-    colormapping, matching diff_pred_20x.ipynb's demo-cell visualization — the ViT's actual input
-    (predict_displacement()'s diff tensor) is never clipped, matching the notebook's real
+def diff_mag_image(cur_rgb: np.ndarray, goal_rgb: np.ndarray, blur_sigma: float | None) -> np.ndarray:
+    """|blur(cur) - blur(goal)| (or the unblurred |cur - goal| when blur_sigma is None) — the same
+    diff the ViT regresses on — as an IMG_SIZE x IMG_SIZE BGR heatmap (cv2 GaussianBlur stand-in for
+    the torch depthwise-conv blur used at inference time, since this is for display only).
+    blur_sigma should be None for diff_pred_robust checkpoints (no preprocessing blur — see
+    predict_displacement()) and BLUR_SIGMA for diff_pred_20x ones. Clipped to MAX_CLIP (0-255 scale)
+    before colormapping, matching diff_pred_20x.ipynb's demo-cell visualization — the ViT's actual
+    input (predict_displacement()'s diff tensor) is never clipped, matching the notebook's real
     extract_embedding() path."""
     cur  = cv2.resize(cur_rgb,  (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     goal = cv2.resize(goal_rgb, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-    k = 2 * max(1, int(round(3 * BLUR_SIGMA))) + 1
-    cur_b  = cv2.GaussianBlur(cur,  (k, k), BLUR_SIGMA)
-    goal_b = cv2.GaussianBlur(goal, (k, k), BLUR_SIGMA)
-    mag_255 = np.mean(np.abs(cur_b - goal_b), axis=2) * 255.0
+    if blur_sigma:
+        k = 2 * max(1, int(round(3 * blur_sigma))) + 1
+        cur  = cv2.GaussianBlur(cur,  (k, k), blur_sigma)
+        goal = cv2.GaussianBlur(goal, (k, k), blur_sigma)
+    mag_255 = np.mean(np.abs(cur - goal), axis=2) * 255.0
     mag_clipped = np.clip(mag_255, 0, MAX_CLIP)
     mag_u8 = (mag_clipped / MAX_CLIP * 255.0).astype(np.uint8)
     return cv2.applyColorMap(mag_u8, cv2.COLORMAP_JET)
@@ -320,10 +351,12 @@ def opacity_mouse_callback(event, x, y, flags, c: dict) -> None:
         c['opacity'] = float(np.clip(frac, 0.0, 1.0))
 
 
-def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarray,
-                 mode: str, pred: np.ndarray, real: dict, c: dict) -> np.ndarray:
+def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarray, diff_label: str,
+                 mode: str, pred_str: str, real: dict, c: dict) -> np.ndarray:
     """Combine the live feed, SIFT-warped goal, and diff-mag heatmap into one canvas, with a custom
-    opacity-slider strip and a status strip (mode + predicted/real displacement) underneath."""
+    opacity-slider strip and a status strip (mode + predicted/real displacement) underneath.
+    pred_str/diff_label are pre-formatted by the caller since their content (which axes, blurred or
+    not) depends on which checkpoint (diff_pred_20x vs diff_pred_robust) is loaded."""
 
     def fit(img):
         ih, iw = img.shape[:2]
@@ -336,7 +369,7 @@ def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarra
         f'top=({c["off_x"]:+.0f},{c["off_y"]:+.0f}) op={c.get("opacity", 0.0):.2f}',
         f'bottom=({c["bx"]:+.0f},{c["by"]:+.0f})',
     ])
-    diff_p = label(fit(diff_bgr), ['DIFF MAG |cur-goal|'])
+    diff_p = label(fit(diff_bgr), [diff_label])
 
     top = np.hstack([live_p, goal_p, diff_p])
 
@@ -353,7 +386,7 @@ def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarra
     }[mode]
     status = label(status, [
         mode_line,
-        f'Predicted (cur->goal): dx={pred[0]:+.4f}mm dy={pred[1]:+.4f}mm  dcx={pred[2]:+.2f}px dcy={pred[3]:+.2f}px darea={pred[4]:+.2f}px2',
+        f'Predicted (cur->goal): {pred_str}',
         f'Real (since ref, m to reset): dx={real["x"]:+.4f}mm dy={real["y"]:+.4f}mm dz={real["z"]:+.4f}mm',
     ])
 
@@ -371,8 +404,10 @@ def parse_args():
     p.add_argument('--bottom', default=None, help='Bottom image path (default: <folder>/bottom.jpg)')
     p.add_argument('--step',   type=int, default=10, help='Pixels nudged per key press when positioning --top over --bottom, or --bottom over the live view')
     p.add_argument('--ratio',  type=float, default=0.75, help="Lowe's ratio test threshold for the one-time SIFT registration of --bottom onto the live view")
-    p.add_argument('--ckpt',   default=str(REPO_ROOT / 'checkpoints' / 'diff_pred_20x_epoch_0099.pt'),
-                                              help='Path to a diff_pred_20x checkpoint (.pt)')
+    p.add_argument('--ckpt',   default=str(REPO_ROOT / 'checkpoints' / 'diff_pred_robust_epoch_0300.pt'),
+                                              help='Path to a diff_pred_20x or diff_pred_robust checkpoint (.pt) — '
+                                                   'target_dim, blur, and diff-order behavior are auto-detected '
+                                                   '(see load_checkpoint())')
     return p.parse_args()
 
 
@@ -395,9 +430,17 @@ def main():
     print(f'Device: {device}')
 
     # ── model ─────────────────────────────────────────────────────────────────
-    vit, head = build_model(device)
-    delta_mean, delta_std = load_checkpoint(Path(args.ckpt), vit, head, device)
-    blur_kernel = make_gaussian_kernel(BLUR_SIGMA, device)
+    ckpt, target_dim = load_checkpoint(Path(args.ckpt), device)
+    is_robust = target_dim == 2   # diff_pred_robust (2) vs. diff_pred_20x (5)
+    vit, head = build_model(device, target_dim)
+    delta_mean, delta_std = apply_checkpoint(ckpt, vit, head, device)
+    blur_kernel = None if is_robust else make_gaussian_kernel(BLUR_SIGMA, device)
+    diff_label = 'DIFF MAG |cur-goal|' + (' (no blur)' if is_robust else f' (blur σ={BLUR_SIGMA})')
+    if is_robust:
+        pred_fields = [('dx', 'mm', '+.4f'), ('dy', 'mm', '+.4f')]
+    else:
+        pred_fields = [('dx', 'mm', '+.4f'), ('dy', 'mm', '+.4f'),
+                       ('dcx', 'px', '+.2f'), ('dcy', 'px', '+.2f'), ('darea', 'px2', '+.2f')]
 
     # ── unified window — live feed, goal composite, and diff-mag heatmap all live here ──────────
     WIN = 'Shadow Mode'
@@ -440,12 +483,13 @@ def main():
             goal_rgb    = bake_goal(warped_goal)
 
             pred = predict_displacement(frame_rgb, goal_rgb, vit, head, blur_kernel,
-                                        delta_mean, delta_std, device)
+                                        delta_mean, delta_std, device, is_robust)
+            pred_str = '  '.join(f'{n}={pred[i]:{fmt}}{u}' for i, (n, u, fmt) in enumerate(pred_fields))
             cur_pos = arm.positions()
             real = {axis: cur_pos[axis] - ref_pos[axis] for axis in ('x', 'y', 'z')}
 
-            diff_img = diff_mag_image(frame_rgb, goal_rgb)
-            canvas   = compose_view(frame_bgr, warped_goal, diff_img, mode, pred, real, c)
+            diff_img = diff_mag_image(frame_rgb, goal_rgb, None if is_robust else BLUR_SIGMA)
+            canvas   = compose_view(frame_bgr, warped_goal, diff_img, diff_label, mode, pred_str, real, c)
             cv2.imshow(WIN, canvas)
 
             key = cv2.waitKey(1)
