@@ -242,6 +242,18 @@ def pick_folder() -> Path:
     return folders[int(choice)]
 
 
+def _crop_10x_fov(img: np.ndarray) -> np.ndarray:
+    """Center-crop a raw 10x-magnification still, at native resolution (no resizing), to the same
+    width/height fraction diff_pred_robust.ipynb's _cache_image() crops after its resize-to-
+    (BOTTOM_RESIZE_W, BOTTOM_RESIZE_H) step — simulating the ~2x zoom needed to match a 20x FOV,
+    without losing the detail a resize-then-crop would."""
+    nh, nw = img.shape[:2]
+    crop_h = round(nh * IMG_SIZE / BOTTOM_RESIZE_H)
+    crop_w = round(nw * IMG_SIZE / BOTTOM_RESIZE_W)
+    y0, x0 = (nh - crop_h) // 2, (nw - crop_w) // 2
+    return img[y0:y0 + crop_h, x0:x0 + crop_w].copy()
+
+
 def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
     """Load top/bottom. Opacity is driven by a custom mouse-dragged slider (see draw_opacity_slider()/
     opacity_mouse_callback()) rather than cv2.createTrackbar, since native OS trackbars snap to a small
@@ -249,17 +261,16 @@ def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
     stays alive for the whole program and is recomputed every frame — see
     update_composite()/nudge_xy()/warp_goal_to_live()/bake_goal().
 
-    If bottom_path is a raw 10x-magnification still (filename contains "10x"), it's center-cropped
-    (at native resolution — no resizing) to the same fraction of its width/height that
-    diff_pred_robust.ipynb's _cache_image() crops after its resize-to-(BOTTOM_RESIZE_W,
-    BOTTOM_RESIZE_H) step, simulating the ~2x zoom needed to match a 20x FOV. This is done here,
-    before sift_affine() (called later, on this same bottom_full), and at native resolution rather
-    than downsized: sift_affine() only fits a translation (no scale), so bottom must already be at
-    20x-equivalent scale to register correctly onto the live (real 20x) camera view, and keeping it
-    at native resolution preserves detail for that SIFT match. Nothing is resized to IMG_SIZE until
-    bake_goal(), right before the ViT actually sees the frame. top_path is left untouched — it
-    shares bottom's native pixel density (same camera/magnification), so translating it over the
-    now-cropped bottom canvas via off_x/off_y is already scale-consistent.
+    top_path/bottom_path are each center-cropped via _crop_10x_fov() when their filename contains
+    "10x" (raw 10x-magnification stills) — never the live camera feed, which stays at full
+    resolution throughout and is only ever resized (never cropped) to IMG_SIZE, in bake_goal(),
+    right before the ViT sees a frame. Cropping both top and bottom the same way means off_x=off_y=0
+    starts with both centered and aligned (matching the "starts centered" convention
+    video_overlay_align.py uses), rather than top's native top-left corner. This also matters for
+    sift_affine() (called later, on this same bottom_full): it only fits a translation (no scale),
+    so bottom must already be at 20x-equivalent scale to register correctly onto the live (real
+    20x) camera view — done here at native resolution rather than downsized, to preserve detail
+    for that SIFT match.
     """
     top_full    = cv2.imread(str(top_path))
     bottom_full = cv2.imread(str(bottom_path))
@@ -268,12 +279,10 @@ def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
     if bottom_full is None:
         raise FileNotFoundError(f'Could not read image: {bottom_path}')
 
+    if '10x' in top_path.name.lower():
+        top_full = _crop_10x_fov(top_full)
     if '10x' in bottom_path.name.lower():
-        nh, nw = bottom_full.shape[:2]
-        crop_h = round(nh * IMG_SIZE / BOTTOM_RESIZE_H)
-        crop_w = round(nw * IMG_SIZE / BOTTOM_RESIZE_W)
-        by0, bx0 = (nh - crop_h) // 2, (nw - crop_w) // 2
-        bottom_full = bottom_full[by0:by0 + crop_h, bx0:bx0 + crop_w].copy()
+        bottom_full = _crop_10x_fov(bottom_full)
 
     h, w = bottom_full.shape[:2]
 
