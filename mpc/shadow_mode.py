@@ -75,13 +75,15 @@ MAX_CLIP    = 60     # diff-mag display clip (0-255 scale) — matches diff_pred
 
 # diff_pred_robust.ipynb resizes raw 10x-magnification stills to (BOTTOM_RESIZE_W, BOTTOM_RESIZE_H)
 # before center-cropping to IMG_SIZE, simulating the ~2x zoom needed to match a 20x FOV. Here we only
-# need the crop FRACTION that recipe implies (IMG_SIZE/BOTTOM_RESIZE_W, IMG_SIZE/BOTTOM_RESIZE_H): the
-# live video feed is captured at 20x while --top/--bottom are raw 10x stills, so those stills are
-# center-cropped to that fraction and then upsampled back to their original pixel dimensions
-# (see _crop_10x_fov()) — a digital zoom that matches the live feed's magnification/pixel density
-# before SIFT registration. The actual resize to IMG_SIZE only happens once, in bake_goal(), right
-# before the ViT sees it. Only applied when the image filename contains "10x" — pre-made design
-# assets (e.g. the old top.jpg/bottom.jpg) are already at the intended scale and are left untouched.
+# need the inverse of the crop fraction that recipe implies (BOTTOM_RESIZE_W/IMG_SIZE,
+# BOTTOM_RESIZE_H/IMG_SIZE): the live video feed is captured at 20x while --top/--bottom are raw 10x
+# stills, so those stills are upsampled by that factor (see _zoom_10x_to_20x()) — no cropping yet —
+# to match the live feed's pixel density before SIFT registration. Order after that: SIFT align ->
+# overlay (update_composite) -> crop down to the live view's actual frame (warp_goal_to_live(), via
+# its SIFT-positioned warpAffine into (live_w, live_h)) -> resize to IMG_SIZE, only once, in
+# bake_goal(), right before the ViT sees it. Zoom only applied when the image filename contains
+# "10x" — pre-made design assets (e.g. the old top.jpg/bottom.jpg) are already at the intended scale
+# and are left untouched.
 BOTTOM_RESIZE_W = 448
 BOTTOM_RESIZE_H = 488
 
@@ -244,20 +246,17 @@ def pick_folder() -> Path:
     return folders[int(choice)]
 
 
-def _crop_10x_fov(img: np.ndarray) -> np.ndarray:
-    """Digitally "zoom in" a raw 10x-magnification still to match the live feed's 20x magnification:
-    center-crop to the width/height fraction diff_pred_robust.ipynb's _cache_image() crops after its
-    resize-to-(BOTTOM_RESIZE_W, BOTTOM_RESIZE_H) step (i.e. the fraction of the FOV a 20x objective
-    actually sees), then upsample that crop back to the image's original pixel dimensions — so the
-    result has the same resolution as the input but the pixel density/FOV of a 20x capture, ready to
-    SIFT-match against the (native-resolution) live 20x view. This is crop+upsample, not
-    crop+downsample-to-224 — the only resize to IMG_SIZE happens later, in bake_goal()."""
+def _zoom_10x_to_20x(img: np.ndarray) -> np.ndarray:
+    """Digitally "zoom in" a raw 10x-magnification still to match the live feed's 20x pixel density,
+    by upsampling the WHOLE image (no cropping) by the inverse of the fraction
+    diff_pred_robust.ipynb's _cache_image() crops after its resize-to-(BOTTOM_RESIZE_W,
+    BOTTOM_RESIZE_H) step. No content is thrown away here — cropping down to the live view's actual
+    FOV happens later, after SIFT alignment and the top/bottom overlay (see warp_goal_to_live()), and
+    the only resize to IMG_SIZE happens after that, in bake_goal()."""
     nh, nw = img.shape[:2]
-    crop_h = round(nh * IMG_SIZE / BOTTOM_RESIZE_H)
-    crop_w = round(nw * IMG_SIZE / BOTTOM_RESIZE_W)
-    y0, x0 = (nh - crop_h) // 2, (nw - crop_w) // 2
-    cropped = img[y0:y0 + crop_h, x0:x0 + crop_w]
-    return cv2.resize(cropped, (nw, nh), interpolation=cv2.INTER_CUBIC)
+    new_h = round(nh * BOTTOM_RESIZE_H / IMG_SIZE)
+    new_w = round(nw * BOTTOM_RESIZE_W / IMG_SIZE)
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
 
 def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
@@ -267,16 +266,18 @@ def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
     stays alive for the whole program and is recomputed every frame — see
     update_composite()/nudge_xy()/warp_goal_to_live()/bake_goal().
 
-    top_path/bottom_path are each digitally zoomed via _crop_10x_fov() when their filename contains
-    "10x" (raw 10x-magnification stills, vs. the live camera feed which is already 20x) — center-
-    cropped to the 20x FOV fraction and upsampled back to their original resolution, never the live
-    camera feed, which stays untouched at full resolution throughout and is only ever resized (never
-    cropped) to IMG_SIZE, in bake_goal(), right before the ViT sees a frame. Zooming both top and
-    bottom the same way means off_x=off_y=0 starts with both centered and aligned (matching the
-    "starts centered" convention video_overlay_align.py uses), rather than top's native top-left
-    corner. This also matters for sift_affine() (called later, on this same bottom_full): it only
-    fits a translation (no scale), so bottom must already be at 20x-equivalent scale/resolution to
-    register correctly onto the live (real 20x) camera view.
+    top_path/bottom_path are each digitally zoomed via _zoom_10x_to_20x() when their filename
+    contains "10x" (raw 10x-magnification stills, vs. the live camera feed which is already 20x) —
+    upsampled (no cropping) to the live feed's pixel density, never the live camera feed itself,
+    which stays untouched at full resolution throughout and is only ever resized (never cropped) to
+    IMG_SIZE, in bake_goal(), right before the ViT sees a frame. Zooming both top and bottom the
+    same way keeps them mutually aligned so off_x=off_y=0 is a sensible default (matching the
+    "starts centered" convention video_overlay_align.py uses). This also matters for sift_affine()
+    (called later, on this same bottom_full): it only fits a translation (no scale), so bottom must
+    already be at 20x-equivalent pixel density to register correctly onto the live (real 20x) camera
+    view — the oversized composite built from this zoomed bottom/top is then cropped down to the
+    live view's actual frame only after that SIFT alignment and the top/bottom overlay (see
+    warp_goal_to_live()).
     """
     top_full    = cv2.imread(str(top_path))
     bottom_full = cv2.imread(str(bottom_path))
@@ -286,9 +287,9 @@ def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
         raise FileNotFoundError(f'Could not read image: {bottom_path}')
 
     if '10x' in top_path.name.lower():
-        top_full = _crop_10x_fov(top_full)
+        top_full = _zoom_10x_to_20x(top_full)
     if '10x' in bottom_path.name.lower():
-        bottom_full = _crop_10x_fov(bottom_full)
+        bottom_full = _zoom_10x_to_20x(bottom_full)
 
     h, w = bottom_full.shape[:2]
 
@@ -331,7 +332,10 @@ def warp_goal_to_live(composite: np.ndarray, sift_M: np.ndarray, bx: float, by: 
                       live_w: int, live_h: int) -> np.ndarray:
     """Warp the (--bottom-space) composite onto the live camera's coordinate frame using the one-time
     SIFT fit, folding in the manual --bottom offset (bx, by) the same way flake_designer.py folds --top's
-    offset into its SIFT fit."""
+    offset into its SIFT fit. Since the composite was built from the upsampled (never cropped)
+    top/bottom (see _zoom_10x_to_20x()), this warpAffine into a (live_w, live_h)-sized output is also
+    where that oversized composite gets cropped down to the live view's actual frame — translation-only,
+    positioned by the SIFT fit rather than a plain center crop."""
     A, t = sift_M[:, :2], sift_M[:, 2]
     t_adj = t + A @ np.array([bx, by], dtype=np.float32)
     M_adj = np.hstack([A, t_adj.reshape(2, 1)]).astype(np.float32)
