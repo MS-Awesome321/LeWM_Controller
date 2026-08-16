@@ -185,8 +185,7 @@ def to_float_frame(frame_rgb: np.ndarray, device: str) -> torch.Tensor:
 @torch.no_grad()
 def predict_displacement(cur_rgb: np.ndarray, goal_rgb: np.ndarray, vit, head,
                          blur_kernel, delta_mean: torch.Tensor, delta_std: torch.Tensor,
-                         device: str, goal_minus_cur: bool, diff_subtract: float = 0.0,
-                         overlay_opacity: float = 0.0) -> np.ndarray:
+                         device: str, goal_minus_cur: bool, diff_subtract: float = 0.0) -> np.ndarray:
     """Predicted displacement (dims depend on the loaded checkpoint's target_dim — mm,mm for
     diff_pred_robust, or mm,mm,px,px,px² for diff_pred_20x) to move from cur -> goal.
 
@@ -198,15 +197,9 @@ def predict_displacement(cur_rgb: np.ndarray, goal_rgb: np.ndarray, vit, head,
     diff_subtract (0-255 scale, live-adjustable via '='/'-' in main()) is subtracted from every pixel
     of the diff — before the ViT ever sees it — to compensate for a systematic brightness offset
     between the live camera and the static top/bottom stills; 0 leaves the diff unchanged.
-
-    overlay_opacity (the same c['opacity'] used to blend --top over --bottom into the goal) darkens
-    cur exactly as a black image blended over it at that opacity would (addWeighted(black, opacity,
-    cur, 1-opacity) == cur * (1-opacity)), since goal's brightness is already diluted by that same
-    opacity fraction of --top — evening out the two frames' overall brightness before differencing.
     """
     cur  = to_float_frame(cur_rgb, device)
     goal = to_float_frame(goal_rgb, device)
-    cur  = cur * (1.0 - overlay_opacity)
     cur_b, goal_b = gaussian_blur(cur, blur_kernel), gaussian_blur(goal, blur_kernel)
     diff = (goal_b - cur_b) if goal_minus_cur else (cur_b - goal_b)
     diff = diff - diff_subtract / 255.0
@@ -320,11 +313,15 @@ def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
 
 def update_composite(c: dict) -> np.ndarray:
     """Recompute c['composite'] from its current offset + opacity. Returns the full-resolution BGR
-    composite (bake_goal() turns it into a goal)."""
+    composite (bake_goal() turns it into a goal).
+
+    composite = opacity * top + bottom (saturating at 255), not the opacity*top + (1-opacity)*bottom
+    weighted blend — bottom is added in full rather than diluted by (1-opacity), so opacity purely
+    controls how much of --top is layered on top of an otherwise-unchanged --bottom."""
     opacity = c['opacity']
     M = np.array([[1.0, 0.0, c['off_x']], [0.0, 1.0, c['off_y']]], dtype=np.float32)
     warped_top = cv2.warpAffine(c['top_full'], M, (c['w'], c['h']))
-    composite = cv2.addWeighted(warped_top, opacity, c['bottom_full'], 1.0 - opacity, 0.0)
+    composite = cv2.addWeighted(warped_top, opacity, c['bottom_full'], 1.0, 0.0)
     c['composite'] = composite
     c['opacity'] = opacity
     return composite
@@ -367,22 +364,19 @@ def bake_goal(warped_goal: np.ndarray) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def diff_mag_image(cur_rgb: np.ndarray, goal_rgb: np.ndarray, blur_sigma: float | None,
-                   goal_minus_cur: bool, diff_subtract: float = 0.0,
-                   overlay_opacity: float = 0.0) -> np.ndarray:
+                   goal_minus_cur: bool, diff_subtract: float = 0.0) -> np.ndarray:
     """|blur(cur) - blur(goal)| (or the unblurred |cur - goal| when blur_sigma is None) — the same
     diff the ViT regresses on — as an IMG_SIZE x IMG_SIZE BGR heatmap (cv2 GaussianBlur stand-in for
     the torch depthwise-conv blur used at inference time, since this is for display only).
     blur_sigma should be None for diff_pred_robust checkpoints (no preprocessing blur — see
-    predict_displacement()) and BLUR_SIGMA for diff_pred_20x ones. goal_minus_cur/diff_subtract/
-    overlay_opacity mirror predict_displacement()'s diff sign convention, live-adjustable offset, and
-    black-overlay brightness correction exactly, so this heatmap always shows what the ViT actually
-    sees. Clipped to MAX_CLIP (0-255 scale) before colormapping (matplotlib's 'inferno', matching
-    diff_pred_robust.ipynb's demo-cell visualization) — the ViT's actual input
-    (predict_displacement()'s diff tensor) is never clipped, matching the notebook's real
-    extract_embedding() path."""
+    predict_displacement()) and BLUR_SIGMA for diff_pred_20x ones. goal_minus_cur/diff_subtract
+    mirror predict_displacement()'s diff sign convention and live-adjustable offset exactly, so this
+    heatmap always shows what the ViT actually sees. Clipped to MAX_CLIP (0-255 scale) before
+    colormapping (matplotlib's 'inferno', matching diff_pred_robust.ipynb's demo-cell visualization)
+    — the ViT's actual input (predict_displacement()'s diff tensor) is never clipped, matching the
+    notebook's real extract_embedding() path."""
     cur  = cv2.resize(cur_rgb,  (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     goal = cv2.resize(goal_rgb, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-    cur  = cur * (1.0 - overlay_opacity)
     if blur_sigma:
         k = 2 * max(1, int(round(3 * blur_sigma))) + 1
         cur  = cv2.GaussianBlur(cur,  (k, k), blur_sigma)
@@ -557,14 +551,13 @@ def main():
             goal_rgb    = bake_goal(warped_goal)
 
             pred = predict_displacement(frame_rgb, goal_rgb, vit, head, blur_kernel,
-                                        delta_mean, delta_std, device, is_robust, diff_subtract,
-                                        c['opacity'])
+                                        delta_mean, delta_std, device, is_robust, diff_subtract)
             pred_str = '  '.join(f'{n}={pred[i]:{fmt}}{u}' for i, (n, u, fmt) in enumerate(pred_fields))
             cur_pos = arm.positions()
             real = {axis: cur_pos[axis] - ref_pos[axis] for axis in ('x', 'y', 'z')}
 
             diff_img = diff_mag_image(frame_rgb, goal_rgb, None if is_robust else BLUR_SIGMA,
-                                      is_robust, diff_subtract, c['opacity'])
+                                      is_robust, diff_subtract)
             diff_label = diff_label_base + f'  subtract={diff_subtract:+.1f}'
             canvas   = compose_view(frame_bgr, warped_goal, diff_img, diff_label, mode, pred_str, real, c)
             cv2.imshow(WIN, canvas)
