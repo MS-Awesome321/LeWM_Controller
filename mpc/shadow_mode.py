@@ -73,13 +73,15 @@ BLUR_SIGMA  = 2.0    # must match diff_pred_20x.ipynb training — only applied 
 TOP_OPACITY = 0.2    # diff_pred_20x.ipynb's default synthetic-composite opacity — initial slider value only
 MAX_CLIP    = 60     # diff-mag display clip (0-255 scale) — matches diff_pred_20x.ipynb's demo-cell visualization clip; display only, never applied to the ViT's actual input
 
-# diff_pred_robust.ipynb's resize sizes for raw 10x-magnification stills — resizing (then, for
-# bottom, center-cropping) simulates the ~2x zoom needed to match a 20x FOV (see init_composer()).
-# Only applied when the image filename contains "10x" — pre-made design assets (e.g. the old
-# top.jpg/bottom.jpg) are already at the intended scale and are left untouched.
+# diff_pred_robust.ipynb resizes raw 10x-magnification stills to (BOTTOM_RESIZE_W, BOTTOM_RESIZE_H)
+# before center-cropping to IMG_SIZE, simulating the ~2x zoom needed to match a 20x FOV. Here we
+# only need the crop FRACTION that recipe implies (IMG_SIZE/BOTTOM_RESIZE_W, IMG_SIZE/BOTTOM_RESIZE_H)
+# — applied directly to the native-resolution image (see init_composer()) so no detail is lost
+# before SIFT registration; the actual resize to IMG_SIZE only happens once, in bake_goal(), right
+# before the ViT sees it. Only applied when the image filename contains "10x" — pre-made design
+# assets (e.g. the old top.jpg/bottom.jpg) are already at the intended scale and are left untouched.
 BOTTOM_RESIZE_W = 448
 BOTTOM_RESIZE_H = 488
-TOP_RESIZE      = 448
 
 DEBOUNCE = 15   # loop iterations to skip after a jog key press (same scheme as manual_control.py)
 
@@ -247,14 +249,17 @@ def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
     stays alive for the whole program and is recomputed every frame — see
     update_composite()/nudge_xy()/warp_goal_to_live()/bake_goal().
 
-    If bottom_path is a raw 10x-magnification still (filename contains "10x"), it's resized to
-    (BOTTOM_RESIZE_W, BOTTOM_RESIZE_H) and center-cropped to IMG_SIZE — the same treatment
-    diff_pred_robust.ipynb's _cache_image() applies to its bottom image, simulating the ~2x zoom
-    needed to match a 20x FOV. This also matters for sift_affine() below: it only fits a
-    translation (no scale), so bottom must already be at 20x-equivalent scale before being
-    registered onto the live (real 20x) camera view. top_path gets the matching resize (to
-    TOP_RESIZE, uncropped, matching diff_pred_robust's top treatment) so it composites onto the
-    now-rescaled bottom at a consistent scale, with room left to nudge its position via off_x/off_y.
+    If bottom_path is a raw 10x-magnification still (filename contains "10x"), it's center-cropped
+    (at native resolution — no resizing) to the same fraction of its width/height that
+    diff_pred_robust.ipynb's _cache_image() crops after its resize-to-(BOTTOM_RESIZE_W,
+    BOTTOM_RESIZE_H) step, simulating the ~2x zoom needed to match a 20x FOV. This is done here,
+    before sift_affine() (called later, on this same bottom_full), and at native resolution rather
+    than downsized: sift_affine() only fits a translation (no scale), so bottom must already be at
+    20x-equivalent scale to register correctly onto the live (real 20x) camera view, and keeping it
+    at native resolution preserves detail for that SIFT match. Nothing is resized to IMG_SIZE until
+    bake_goal(), right before the ViT actually sees the frame. top_path is left untouched — it
+    shares bottom's native pixel density (same camera/magnification), so translating it over the
+    now-cropped bottom canvas via off_x/off_y is already scale-consistent.
     """
     top_full    = cv2.imread(str(top_path))
     bottom_full = cv2.imread(str(bottom_path))
@@ -264,12 +269,11 @@ def init_composer(top_path: Path, bottom_path: Path, win: str) -> dict:
         raise FileNotFoundError(f'Could not read image: {bottom_path}')
 
     if '10x' in bottom_path.name.lower():
-        bottom_resized = cv2.resize(bottom_full, (BOTTOM_RESIZE_W, BOTTOM_RESIZE_H), interpolation=cv2.INTER_AREA)
-        bh, bw = bottom_resized.shape[:2]
-        by0, bx0 = (bh - IMG_SIZE) // 2, (bw - IMG_SIZE) // 2
-        bottom_full = bottom_resized[by0:by0 + IMG_SIZE, bx0:bx0 + IMG_SIZE].copy()
-    if '10x' in top_path.name.lower():
-        top_full = cv2.resize(top_full, (TOP_RESIZE, TOP_RESIZE), interpolation=cv2.INTER_AREA)
+        nh, nw = bottom_full.shape[:2]
+        crop_h = round(nh * IMG_SIZE / BOTTOM_RESIZE_H)
+        crop_w = round(nw * IMG_SIZE / BOTTOM_RESIZE_W)
+        by0, bx0 = (nh - crop_h) // 2, (nw - crop_w) // 2
+        bottom_full = bottom_full[by0:by0 + crop_h, bx0:bx0 + crop_w].copy()
 
     h, w = bottom_full.shape[:2]
 
