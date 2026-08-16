@@ -188,7 +188,7 @@ def predict_displacement(cur_rgb: np.ndarray, goal_rgb: np.ndarray, vit, head,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Goal composer — interactive top/bottom positioning + opacity (top.jpg/bottom.jpg are already the
+# Goal composer — interactive top/bottom positioning + opacity (top_10x.jpg/bottom_10x.jpg are already the
 # same resolution and pixel-aligned, so this is a plain translate + blend)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -222,10 +222,10 @@ def sift_affine(small_gray: np.ndarray, large_gray: np.ndarray, ratio_thresh: fl
 
 
 def pick_folder() -> Path:
-    folders = sorted(p for p in DATA_DIR.iterdir() if p.is_dir() and (p / 'top.jpg').exists() and (p / 'bottom.jpg').exists())
+    folders = sorted(p for p in DATA_DIR.iterdir() if p.is_dir() and (p / 'top_10x.jpg').exists() and (p / 'bottom_10x.jpg').exists())
     if not folders:
-        raise FileNotFoundError(f'No folders with top.jpg/bottom.jpg found under {DATA_DIR}')
-    print('Available folders (top.jpg/bottom.jpg pairs):')
+        raise FileNotFoundError(f'No folders with top_10x.jpg/bottom_10x.jpg found under {DATA_DIR}')
+    print('Available folders (top_10x.jpg/bottom_10x.jpg pairs):')
     for idx, path in enumerate(folders):
         print(f'  [{idx}] {path.name}')
     choice = input(f'Pick a folder [0-{len(folders) - 1}]: ').strip()
@@ -399,9 +399,9 @@ def compose_view(live_bgr: np.ndarray, goal_bgr: np.ndarray, diff_bgr: np.ndarra
 
 def parse_args():
     p = argparse.ArgumentParser(description='Manually jog the stage while shadowing diff_pred_20x predictions against real motor motion.')
-    p.add_argument('--folder', default=None, help='20X_DropDown/<n> folder providing top.jpg/bottom.jpg (prompts if omitted and --top/--bottom are not both given)')
-    p.add_argument('--top',    default=None, help='Top image path (default: <folder>/top.jpg)')
-    p.add_argument('--bottom', default=None, help='Bottom image path (default: <folder>/bottom.jpg)')
+    p.add_argument('--folder', default=None, help='20X_DropDown/<n> folder providing top_10x.jpg/bottom_10x.jpg (prompts if omitted and --top/--bottom are not both given)')
+    p.add_argument('--top',    default=None, help='Top image path (default: <folder>/top_10x.jpg)')
+    p.add_argument('--bottom', default=None, help='Bottom image path (default: <folder>/bottom_10x.jpg)')
     p.add_argument('--step',   type=int, default=10, help='Pixels nudged per key press when positioning --top over --bottom, or --bottom over the live view')
     p.add_argument('--ratio',  type=float, default=0.75, help="Lowe's ratio test threshold for the one-time SIFT registration of --bottom onto the live view")
     p.add_argument('--ckpt',   default=str(REPO_ROOT / 'checkpoints' / 'diff_pred_robust_epoch_0300.pt'),
@@ -417,9 +417,9 @@ def main():
     if args.top is None or args.bottom is None:
         folder = Path(args.folder) if args.folder else pick_folder()
         if args.top is None:
-            args.top = str(folder / 'top.jpg')
+            args.top = str(folder / 'top_10x.jpg')
         if args.bottom is None:
-            args.bottom = str(folder / 'bottom.jpg')
+            args.bottom = str(folder / 'bottom_10x.jpg')
 
     if torch.cuda.is_available():
         device = 'cuda'
